@@ -3,3 +3,4 @@
 
 obj-$(CONFIG_DXGKRNL)	+= dxgkrnl.o
 dxgkrnl-y := dxgmodule.o hmgr.o misc.o dxgadapter.o ioctl.o dxgvmbus.o dxgprocess.o  dxgsyncfile.o
+ccflags-y := -D_MAIN_KERNEL_
