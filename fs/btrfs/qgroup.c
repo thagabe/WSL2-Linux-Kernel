@@ -28,6 +28,7 @@
 #include "accessors.h"
 #include "extent-tree.h"
 #include "root-tree.h"
+#include "tree-checker.h"
 
 /*
  * Helpers to access qgroup reservation
@@ -2786,6 +2787,7 @@ int btrfs_qgroup_account_extents(struct btrfs_trans_handle *trans)
 			 * current root. It's safe inside commit_transaction().
 			 */
 			ctx.trans = trans;
+			ctx.time_seq = BTRFS_SEQ_LAST;
 			ret = btrfs_find_all_roots(&ctx, false);
 			if (ret < 0)
 				goto cleanup;
@@ -2965,14 +2967,7 @@ int btrfs_qgroup_inherit(struct btrfs_trans_handle *trans, u64 srcid,
 		dstgroup->rsv_rfer = inherit->lim.rsv_rfer;
 		dstgroup->rsv_excl = inherit->lim.rsv_excl;
 
-		ret = update_qgroup_limit_item(trans, dstgroup);
-		if (ret) {
-			qgroup_mark_inconsistent(fs_info);
-			btrfs_info(fs_info,
-				   "unable to update quota limit for %llu",
-				   dstgroup->qgroupid);
-			goto unlock;
-		}
+		qgroup_dirty(fs_info, dstgroup);
 	}
 
 	if (srcid) {

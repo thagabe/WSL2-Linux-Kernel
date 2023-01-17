@@ -498,6 +498,10 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x0bda, 0xc822), .driver_info = BTUSB_REALTEK |
 						     BTUSB_WIDEBAND_SPEECH },
 
+	/* Realtek 8822CU Bluetooth devices */
+	{ USB_DEVICE(0x13d3, 0x3549), .driver_info = BTUSB_REALTEK |
+						     BTUSB_WIDEBAND_SPEECH },
+
 	/* Realtek 8852AE Bluetooth devices */
 	{ USB_DEVICE(0x0bda, 0x2852), .driver_info = BTUSB_REALTEK |
 						     BTUSB_WIDEBAND_SPEECH },
@@ -526,6 +530,10 @@ static const struct usb_device_id blacklist_table[] = {
 	{ USB_DEVICE(0x13d3, 0x3586), .driver_info = BTUSB_REALTEK |
 						     BTUSB_WIDEBAND_SPEECH },
 	{ USB_DEVICE(0x13d3, 0x3592), .driver_info = BTUSB_REALTEK |
+						     BTUSB_WIDEBAND_SPEECH },
+
+	/* Realtek 8852BE Bluetooth devices */
+	{ USB_DEVICE(0x0cb8, 0xc559), .driver_info = BTUSB_REALTEK |
 						     BTUSB_WIDEBAND_SPEECH },
 
 	/* Realtek Bluetooth devices */
@@ -594,6 +602,9 @@ static const struct usb_device_id blacklist_table[] = {
 						     BTUSB_WIDEBAND_SPEECH |
 						     BTUSB_VALID_LE_STATES },
 	{ USB_DEVICE(0x0489, 0xe0e2), .driver_info = BTUSB_MEDIATEK |
+						     BTUSB_WIDEBAND_SPEECH |
+						     BTUSB_VALID_LE_STATES },
+	{ USB_DEVICE(0x0489, 0xe0f2), .driver_info = BTUSB_MEDIATEK |
 						     BTUSB_WIDEBAND_SPEECH |
 						     BTUSB_VALID_LE_STATES },
 
@@ -905,13 +916,13 @@ static inline void btusb_free_frags(struct btusb_data *data)
 
 	spin_lock_irqsave(&data->rxlock, flags);
 
-	kfree_skb(data->evt_skb);
+	dev_kfree_skb_irq(data->evt_skb);
 	data->evt_skb = NULL;
 
-	kfree_skb(data->acl_skb);
+	dev_kfree_skb_irq(data->acl_skb);
 	data->acl_skb = NULL;
 
-	kfree_skb(data->sco_skb);
+	dev_kfree_skb_irq(data->sco_skb);
 	data->sco_skb = NULL;
 
 	spin_unlock_irqrestore(&data->rxlock, flags);
@@ -2190,18 +2201,19 @@ static int btusb_setup_csr(struct hci_dev *hdev)
 		return err;
 	}
 
-	if (skb->len != sizeof(struct hci_rp_read_local_version)) {
+	rp = skb_pull_data(skb, sizeof(*rp));
+	if (!rp) {
 		bt_dev_err(hdev, "CSR: Local version length mismatch");
 		kfree_skb(skb);
 		return -EIO;
 	}
 
-	rp = (struct hci_rp_read_local_version *)skb->data;
+	bt_dev_info(hdev, "CSR: Setting up dongle with HCI ver=%u rev=%04x",
+		    rp->hci_ver, le16_to_cpu(rp->hci_rev));
 
-	bt_dev_info(hdev, "CSR: Setting up dongle with HCI ver=%u rev=%04x; LMP ver=%u subver=%04x; manufacturer=%u",
-		le16_to_cpu(rp->hci_ver), le16_to_cpu(rp->hci_rev),
-		le16_to_cpu(rp->lmp_ver), le16_to_cpu(rp->lmp_subver),
-		le16_to_cpu(rp->manufacturer));
+	bt_dev_info(hdev, "LMP ver=%u subver=%04x; manufacturer=%u",
+		    rp->lmp_ver, le16_to_cpu(rp->lmp_subver),
+		    le16_to_cpu(rp->manufacturer));
 
 	/* Detect a wide host of Chinese controllers that aren't CSR.
 	 *
@@ -2231,29 +2243,29 @@ static int btusb_setup_csr(struct hci_dev *hdev)
 	 *      third-party BT 4.0 dongle reuses it.
 	 */
 	else if (le16_to_cpu(rp->lmp_subver) <= 0x034e &&
-		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_1_1)
+		 rp->hci_ver > BLUETOOTH_VER_1_1)
 		is_fake = true;
 
 	else if (le16_to_cpu(rp->lmp_subver) <= 0x0529 &&
-		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_1_2)
+		 rp->hci_ver > BLUETOOTH_VER_1_2)
 		is_fake = true;
 
 	else if (le16_to_cpu(rp->lmp_subver) <= 0x0c5c &&
-		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_2_0)
+		 rp->hci_ver > BLUETOOTH_VER_2_0)
 		is_fake = true;
 
 	else if (le16_to_cpu(rp->lmp_subver) <= 0x1899 &&
-		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_2_1)
+		 rp->hci_ver > BLUETOOTH_VER_2_1)
 		is_fake = true;
 
 	else if (le16_to_cpu(rp->lmp_subver) <= 0x22bb &&
-		 le16_to_cpu(rp->hci_ver) > BLUETOOTH_VER_4_0)
+		 rp->hci_ver > BLUETOOTH_VER_4_0)
 		is_fake = true;
 
 	/* Other clones which beat all the above checks */
 	else if (bcdDevice == 0x0134 &&
 		 le16_to_cpu(rp->lmp_subver) == 0x0c5c &&
-		 le16_to_cpu(rp->hci_ver) == BLUETOOTH_VER_2_0)
+		 rp->hci_ver == BLUETOOTH_VER_2_0)
 		is_fake = true;
 
 	if (is_fake) {
@@ -3411,7 +3423,7 @@ static int btusb_setup_qca_load_rampatch(struct hci_dev *hdev,
 
 	if (ver_rom & ~0xffffU) {
 		rver_rom_high = le16_to_cpu(rver->rom_version_high);
-		rver_rom = le32_to_cpu(rver_rom_high << 16 | rver_rom_low);
+		rver_rom = rver_rom_high << 16 | rver_rom_low;
 	} else {
 		rver_rom = rver_rom_low;
 	}

@@ -4,6 +4,8 @@
  * Copyright (c) 2015 System Fabric Works, Inc. All rights reserved.
  */
 
+#include <linux/libnvdimm.h>
+
 #include "rxe.h"
 #include "rxe_loc.h"
 
@@ -97,6 +99,7 @@ err2:
 		kfree(mr->map[i]);
 
 	kfree(mr->map);
+	mr->map = NULL;
 err1:
 	return -ENOMEM;
 }
@@ -110,6 +113,15 @@ void rxe_mr_init_dma(int access, struct rxe_mr *mr)
 	mr->ibmr.type = IB_MR_TYPE_DMA;
 }
 
+static bool is_pmem_page(struct page *pg)
+{
+	unsigned long paddr = page_to_phys(pg);
+
+	return REGION_INTERSECTS ==
+	       region_intersects(paddr, PAGE_SIZE, IORESOURCE_MEM,
+				 IORES_DESC_PERSISTENT_MEMORY);
+}
+
 int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
 		     int access, struct rxe_mr *mr)
 {
@@ -120,7 +132,6 @@ int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
 	int			num_buf;
 	void			*vaddr;
 	int err;
-	int i;
 
 	umem = ib_umem_get(&rxe->ib_dev, start, length, access);
 	if (IS_ERR(umem)) {
@@ -146,22 +157,30 @@ int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
 	num_buf			= 0;
 	map = mr->map;
 	if (length > 0) {
-		buf = map[0]->buf;
+		bool persistent_access = access & IB_ACCESS_FLUSH_PERSISTENT;
 
+		buf = map[0]->buf;
 		for_each_sgtable_page (&umem->sgt_append.sgt, &sg_iter, 0) {
+			struct page *pg = sg_page_iter_page(&sg_iter);
+
+			if (persistent_access && !is_pmem_page(pg)) {
+				rxe_dbg_mr(mr, "Unable to register persistent access to non-pmem device\n");
+				err = -EINVAL;
+				goto err_release_umem;
+			}
+
 			if (num_buf >= RXE_BUF_PER_MAP) {
 				map++;
 				buf = map[0]->buf;
 				num_buf = 0;
 			}
 
-			vaddr = page_address(sg_page_iter_page(&sg_iter));
+			vaddr = page_address(pg);
 			if (!vaddr) {
 				rxe_dbg_mr(mr, "Unable to get virtual address\n");
 				err = -ENOMEM;
-				goto err_cleanup_map;
+				goto err_release_umem;
 			}
-
 			buf->addr = (uintptr_t)vaddr;
 			buf->size = PAGE_SIZE;
 			num_buf++;
@@ -175,13 +194,10 @@ int rxe_mr_init_user(struct rxe_dev *rxe, u64 start, u64 length, u64 iova,
 	mr->offset = ib_umem_offset(umem);
 	mr->state = RXE_MR_STATE_VALID;
 	mr->ibmr.type = IB_MR_TYPE_USER;
+	mr->ibmr.page_size = PAGE_SIZE;
 
 	return 0;
 
-err_cleanup_map:
-	for (i = 0; i < mr->num_map; i++)
-		kfree(mr->map[i]);
-	kfree(mr->map);
 err_release_umem:
 	ib_umem_release(umem);
 err_out:
@@ -280,6 +296,39 @@ void *iova_to_vaddr(struct rxe_mr *mr, u64 iova, int length)
 
 out:
 	return addr;
+}
+
+int rxe_flush_pmem_iova(struct rxe_mr *mr, u64 iova, int length)
+{
+	size_t offset;
+
+	if (length == 0)
+		return 0;
+
+	if (mr->ibmr.type == IB_MR_TYPE_DMA)
+		return -EFAULT;
+
+	offset = (iova - mr->ibmr.iova + mr->offset) & mr->page_mask;
+	while (length > 0) {
+		u8 *va;
+		int bytes;
+
+		bytes = mr->ibmr.page_size - offset;
+		if (bytes > length)
+			bytes = length;
+
+		va = iova_to_vaddr(mr, iova, length);
+		if (!va)
+			return -EFAULT;
+
+		arch_wb_cache_pmem(va, bytes);
+
+		length -= bytes;
+		iova += bytes;
+		offset = 0;
+	}
+
+	return 0;
 }
 
 /* copy data from a range (vaddr, vaddr+length-1) to or from
@@ -524,7 +573,7 @@ int rxe_invalidate_mr(struct rxe_qp *qp, u32 key)
 
 	mr = rxe_pool_get_index(&rxe->mr_pool, key >> 8);
 	if (!mr) {
-		rxe_dbg_mr(mr, "No MR for key %#x\n", key);
+		rxe_dbg_qp(qp, "No MR for key %#x\n", key);
 		ret = -EINVAL;
 		goto err;
 	}

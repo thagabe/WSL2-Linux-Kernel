@@ -433,22 +433,18 @@ nfsd_file_check_writeback(struct nfsd_file *nf)
 static bool nfsd_file_lru_add(struct nfsd_file *nf)
 {
 	set_bit(NFSD_FILE_REFERENCED, &nf->nf_flags);
-	if (!test_and_set_bit(NFSD_FILE_LRU, &nf->nf_flags)) {
-		if (list_lru_add(&nfsd_file_lru, &nf->nf_lru)) {
-			trace_nfsd_file_lru_add(nf);
-			return true;
-		}
+	if (list_lru_add(&nfsd_file_lru, &nf->nf_lru)) {
+		trace_nfsd_file_lru_add(nf);
+		return true;
 	}
 	return false;
 }
 
 static bool nfsd_file_lru_remove(struct nfsd_file *nf)
 {
-	if (test_and_clear_bit(NFSD_FILE_LRU, &nf->nf_flags)) {
-		if (list_lru_del(&nfsd_file_lru, &nf->nf_lru)) {
-			trace_nfsd_file_lru_del(nf);
-			return true;
-		}
+	if (list_lru_del(&nfsd_file_lru, &nf->nf_lru)) {
+		trace_nfsd_file_lru_del(nf);
+		return true;
 	}
 	return false;
 }
@@ -459,35 +455,6 @@ nfsd_file_get(struct nfsd_file *nf)
 	if (likely(refcount_inc_not_zero(&nf->nf_ref)))
 		return nf;
 	return NULL;
-}
-
-/**
- * nfsd_file_unhash_and_queue - unhash a file and queue it to the dispose list
- * @nf: nfsd_file to be unhashed and queued
- * @dispose: list to which it should be queued
- *
- * Attempt to unhash a nfsd_file and queue it to the given list. Each file
- * will have a reference held on behalf of the list. That reference may come
- * from the LRU, or we may need to take one. If we can't get a reference,
- * ignore it altogether.
- */
-static bool
-nfsd_file_unhash_and_queue(struct nfsd_file *nf, struct list_head *dispose)
-{
-	trace_nfsd_file_unhash_and_queue(nf);
-	if (nfsd_file_unhash(nf)) {
-		/*
-		 * If we remove it from the LRU, then just use that
-		 * reference for the dispose list. Otherwise, we need
-		 * to take a reference. If that fails, just ignore
-		 * the file altogether.
-		 */
-		if (!nfsd_file_lru_remove(nf) && !nfsd_file_get(nf))
-			return false;
-		list_add(&nf->nf_lru, dispose);
-		return true;
-	}
-	return false;
 }
 
 /**
@@ -631,12 +598,6 @@ nfsd_file_lru_cb(struct list_head *item, struct list_lru_one *lru,
 		return LRU_ROTATE;
 	}
 
-	/* Make sure we're not racing with another removal. */
-	if (!test_and_clear_bit(NFSD_FILE_LRU, &nf->nf_flags)) {
-		trace_nfsd_file_gc_removing(nf);
-		return LRU_SKIP;
-	}
-
 	/*
 	 * Put the reference held on behalf of the LRU. If it wasn't the last
 	 * one, then just remove it from the LRU and ignore it.
@@ -700,15 +661,24 @@ static struct shrinker	nfsd_file_shrinker = {
 	.seeks = 1,
 };
 
-/*
- * Find all cache items across all net namespaces that match @inode, unhash
- * them, take references and then put them on @dispose if that was successful.
+/**
+ * nfsd_file_queue_for_close: try to close out any open nfsd_files for an inode
+ * @inode:   inode on which to close out nfsd_files
+ * @dispose: list on which to gather nfsd_files to close out
  *
- * The nfsd_file objects on the list will be unhashed, and each will have a
- * reference taken.
+ * An nfsd_file represents a struct file being held open on behalf of nfsd. An
+ * open file however can block other activity (such as leases), or cause
+ * undesirable behavior (e.g. spurious silly-renames when reexporting NFS).
+ *
+ * This function is intended to find open nfsd_files when this sort of
+ * conflicting access occurs and then attempt to close those files out.
+ *
+ * Populates the dispose list with entries that have already had their
+ * refcounts go to zero. The actual free of an nfsd_file can be expensive,
+ * so we leave it up to the caller whether it wants to wait or not.
  */
 static void
-__nfsd_file_close_inode(struct inode *inode, struct list_head *dispose)
+nfsd_file_queue_for_close(struct inode *inode, struct list_head *dispose)
 {
 	struct nfsd_file_lookup_key key = {
 		.type	= NFSD_FILE_KEY_INODE,
@@ -718,12 +688,30 @@ __nfsd_file_close_inode(struct inode *inode, struct list_head *dispose)
 
 	rcu_read_lock();
 	do {
+		int decrement = 1;
+
 		nf = rhashtable_lookup(&nfsd_file_rhash_tbl, &key,
 				       nfsd_file_rhash_params);
 		if (!nf)
 			break;
 
-		nfsd_file_unhash_and_queue(nf, dispose);
+		/* If we raced with someone else unhashing, ignore it */
+		if (!nfsd_file_unhash(nf))
+			continue;
+
+		/* If we can't get a reference, ignore it */
+		if (!nfsd_file_get(nf))
+			continue;
+
+		/* Extra decrement if we remove from the LRU */
+		if (nfsd_file_lru_remove(nf))
+			++decrement;
+
+		/* If refcount goes to 0, then put on the dispose list */
+		if (refcount_sub_and_test(decrement, &nf->nf_ref)) {
+			list_add(&nf->nf_lru, dispose);
+			trace_nfsd_file_closing(nf);
+		}
 	} while (1);
 	rcu_read_unlock();
 }
@@ -732,22 +720,17 @@ __nfsd_file_close_inode(struct inode *inode, struct list_head *dispose)
  * nfsd_file_close_inode - attempt a delayed close of a nfsd_file
  * @inode: inode of the file to attempt to remove
  *
- * Unhash and put all cache item associated with @inode. Queue any that have
- * refcounts that go to zero to the dispose_list_delayed infrastructure for
- * eventual cleanup.
+ * Close out any open nfsd_files that can be reaped for @inode. The
+ * actual freeing is deferred to the dispose_list_delayed infrastructure.
+ *
+ * This is used by the fsnotify callbacks and setlease notifier.
  */
 static void
 nfsd_file_close_inode(struct inode *inode)
 {
-	struct nfsd_file *nf, *tmp;
 	LIST_HEAD(dispose);
 
-	__nfsd_file_close_inode(inode, &dispose);
-	list_for_each_entry_safe(nf, tmp, &dispose, nf_lru) {
-		trace_nfsd_file_closing(nf);
-		if (!refcount_dec_and_test(&nf->nf_ref))
-			list_del_init(&nf->nf_lru);
-	}
+	nfsd_file_queue_for_close(inode, &dispose);
 	nfsd_file_dispose_list_delayed(&dispose);
 }
 
@@ -755,7 +738,11 @@ nfsd_file_close_inode(struct inode *inode)
  * nfsd_file_close_inode_sync - attempt to forcibly close a nfsd_file
  * @inode: inode of the file to attempt to remove
  *
- * Unhash and put, then flush and fput all cache items associated with @inode.
+ * Close out any open nfsd_files that can be reaped for @inode. The
+ * nfsd_files are closed out synchronously.
+ *
+ * This is called from nfsd_rename and nfsd_unlink to avoid silly-renames
+ * when reexporting NFS.
  */
 void
 nfsd_file_close_inode_sync(struct inode *inode)
@@ -765,13 +752,11 @@ nfsd_file_close_inode_sync(struct inode *inode)
 
 	trace_nfsd_file_close(inode);
 
-	__nfsd_file_close_inode(inode, &dispose);
+	nfsd_file_queue_for_close(inode, &dispose);
 	while (!list_empty(&dispose)) {
 		nf = list_first_entry(&dispose, struct nfsd_file, nf_lru);
 		list_del_init(&nf->nf_lru);
-		trace_nfsd_file_closing(nf);
-		if (refcount_dec_and_test(&nf->nf_ref))
-			nfsd_file_free(nf);
+		nfsd_file_free(nf);
 	}
 	flush_delayed_fput();
 }
@@ -923,6 +908,13 @@ out_err:
 	goto out;
 }
 
+/**
+ * __nfsd_file_cache_purge: clean out the cache for shutdown
+ * @net: net-namespace to shut down the cache (may be NULL)
+ *
+ * Walk the nfsd_file cache and close out any that match @net. If @net is NULL,
+ * then close out everything. Called when an nfsd instance is being shut down.
+ */
 static void
 __nfsd_file_cache_purge(struct net *net)
 {
@@ -936,8 +928,11 @@ __nfsd_file_cache_purge(struct net *net)
 
 		nf = rhashtable_walk_next(&iter);
 		while (!IS_ERR_OR_NULL(nf)) {
-			if (!net || nf->nf_net == net)
-				nfsd_file_unhash_and_queue(nf, &dispose);
+			if (!net || nf->nf_net == net) {
+				nfsd_file_unhash(nf);
+				nfsd_file_lru_remove(nf);
+				list_add(&nf->nf_lru, &dispose);
+			}
 			nf = rhashtable_walk_next(&iter);
 		}
 
@@ -1076,8 +1071,8 @@ nfsd_file_is_cached(struct inode *inode)
 
 static __be32
 nfsd_file_do_acquire(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		     unsigned int may_flags, struct nfsd_file **pnf,
-		     bool open, bool want_gc)
+		     unsigned int may_flags, struct file *file,
+		     struct nfsd_file **pnf, bool want_gc)
 {
 	struct nfsd_file_lookup_key key = {
 		.type	= NFSD_FILE_KEY_FULL,
@@ -1101,13 +1096,15 @@ retry:
 	rcu_read_lock();
 	nf = rhashtable_lookup(&nfsd_file_rhash_tbl, &key,
 			       nfsd_file_rhash_params);
-	if (nf) {
-		if (!nfsd_file_lru_remove(nf))
-			nf = nfsd_file_get(nf);
-	}
-	rcu_read_unlock();
 	if (nf)
+		nf = nfsd_file_get(nf);
+	rcu_read_unlock();
+
+	if (nf) {
+		if (nfsd_file_lru_remove(nf))
+			WARN_ON_ONCE(refcount_dec_and_test(&nf->nf_ref));
 		goto wait_for_construction;
+	}
 
 	nf = nfsd_file_alloc(&key, may_flags);
 	if (!nf) {
@@ -1150,8 +1147,7 @@ wait_for_construction:
 	status = nfserrno(nfsd_open_break_lease(file_inode(nf->nf_file), may_flags));
 out:
 	if (status == nfs_ok) {
-		if (open)
-			this_cpu_inc(nfsd_file_acquisitions);
+		this_cpu_inc(nfsd_file_acquisitions);
 		*pnf = nf;
 	} else {
 		if (refcount_dec_and_test(&nf->nf_ref))
@@ -1161,27 +1157,32 @@ out:
 
 out_status:
 	put_cred(key.cred);
-	if (open)
-		trace_nfsd_file_acquire(rqstp, key.inode, may_flags, nf, status);
+	trace_nfsd_file_acquire(rqstp, key.inode, may_flags, nf, status);
 	return status;
 
 open_file:
 	trace_nfsd_file_alloc(nf);
 	nf->nf_mark = nfsd_file_mark_find_or_create(nf, key.inode);
 	if (nf->nf_mark) {
-		if (open) {
+		if (file) {
+			get_file(file);
+			nf->nf_file = file;
+			status = nfs_ok;
+			trace_nfsd_file_opened(nf, status);
+		} else {
 			status = nfsd_open_verified(rqstp, fhp, may_flags,
 						    &nf->nf_file);
 			trace_nfsd_file_open(nf, status);
-		} else
-			status = nfs_ok;
+		}
 	} else
 		status = nfserr_jukebox;
 	/*
 	 * If construction failed, or we raced with a call to unlink()
 	 * then unhash.
 	 */
-	if (status != nfs_ok || key.inode->i_nlink == 0)
+	if (status == nfs_ok && key.inode->i_nlink == 0)
+		status = nfserr_jukebox;
+	if (status != nfs_ok)
 		nfsd_file_unhash(nf);
 	clear_bit_unlock(NFSD_FILE_PENDING, &nf->nf_flags);
 	smp_mb__after_atomic();
@@ -1208,7 +1209,7 @@ __be32
 nfsd_file_acquire_gc(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		     unsigned int may_flags, struct nfsd_file **pnf)
 {
-	return nfsd_file_do_acquire(rqstp, fhp, may_flags, pnf, true, true);
+	return nfsd_file_do_acquire(rqstp, fhp, may_flags, NULL, pnf, true);
 }
 
 /**
@@ -1229,28 +1230,30 @@ __be32
 nfsd_file_acquire(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		  unsigned int may_flags, struct nfsd_file **pnf)
 {
-	return nfsd_file_do_acquire(rqstp, fhp, may_flags, pnf, true, false);
+	return nfsd_file_do_acquire(rqstp, fhp, may_flags, NULL, pnf, false);
 }
 
 /**
- * nfsd_file_create - Get a struct nfsd_file, do not open
+ * nfsd_file_acquire_opened - Get a struct nfsd_file using existing open file
  * @rqstp: the RPC transaction being executed
  * @fhp: the NFS filehandle of the file just created
  * @may_flags: NFSD_MAY_ settings for the file
+ * @file: cached, already-open file (may be NULL)
  * @pnf: OUT: new or found "struct nfsd_file" object
  *
- * The nfsd_file_object returned by this API is reference-counted
- * but not garbage-collected. The object is released immediately
- * one RCU grace period after the final nfsd_file_put().
+ * Acquire a nfsd_file object that is not GC'ed. If one doesn't already exist,
+ * and @file is non-NULL, use it to instantiate a new nfsd_file instead of
+ * opening a new one.
  *
  * Returns nfs_ok and sets @pnf on success; otherwise an nfsstat in
  * network byte order is returned.
  */
 __be32
-nfsd_file_create(struct svc_rqst *rqstp, struct svc_fh *fhp,
-		 unsigned int may_flags, struct nfsd_file **pnf)
+nfsd_file_acquire_opened(struct svc_rqst *rqstp, struct svc_fh *fhp,
+			 unsigned int may_flags, struct file *file,
+			 struct nfsd_file **pnf)
 {
-	return nfsd_file_do_acquire(rqstp, fhp, may_flags, pnf, false, false);
+	return nfsd_file_do_acquire(rqstp, fhp, may_flags, file, pnf, false);
 }
 
 /*

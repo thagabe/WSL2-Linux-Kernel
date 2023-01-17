@@ -5936,6 +5936,7 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
 		u64 ext_len;
 		u64 clone_len;
 		u64 clone_data_offset;
+		bool crossed_src_i_size = false;
 
 		if (slot >= btrfs_header_nritems(leaf)) {
 			ret = btrfs_next_leaf(clone_root->root, path);
@@ -5993,8 +5994,10 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
 		if (key.offset >= clone_src_i_size)
 			break;
 
-		if (key.offset + ext_len > clone_src_i_size)
+		if (key.offset + ext_len > clone_src_i_size) {
 			ext_len = clone_src_i_size - key.offset;
+			crossed_src_i_size = true;
+		}
 
 		clone_data_offset = btrfs_file_extent_offset(leaf, ei);
 		if (btrfs_file_extent_disk_bytenr(leaf, ei) == disk_byte) {
@@ -6055,6 +6058,25 @@ static int clone_range(struct send_ctx *sctx, struct btrfs_path *dst_path,
 				ret = send_clone(sctx, offset, clone_len,
 						 clone_root);
 			}
+		} else if (crossed_src_i_size && clone_len < len) {
+			/*
+			 * If we are at i_size of the clone source inode and we
+			 * can not clone from it, terminate the loop. This is
+			 * to avoid sending two write operations, one with a
+			 * length matching clone_len and the final one after
+			 * this loop with a length of len - clone_len.
+			 *
+			 * When using encoded writes (BTRFS_SEND_FLAG_COMPRESSED
+			 * was passed to the send ioctl), this helps avoid
+			 * sending an encoded write for an offset that is not
+			 * sector size aligned, in case the i_size of the source
+			 * inode is not sector size aligned. That will make the
+			 * receiver fallback to decompression of the data and
+			 * writing it using regular buffered IO, therefore while
+			 * not incorrect, it's not optimal due decompression and
+			 * possible re-compression at the receiver.
+			 */
+			break;
 		} else {
 			ret = send_extent_data(sctx, dst_path, offset,
 					       clone_len);
@@ -8075,6 +8097,9 @@ long btrfs_ioctl_send(struct inode *inode, struct btrfs_ioctl_send_args *arg)
 	INIT_RADIX_TREE(&sctx->name_cache, GFP_KERNEL);
 	INIT_LIST_HEAD(&sctx->name_cache_list);
 
+	INIT_LIST_HEAD(&sctx->backref_cache.lru_list);
+	mt_init(&sctx->backref_cache.entries);
+
 	sctx->flags = arg->flags;
 
 	if (arg->flags & BTRFS_SEND_FLAG_VERSION) {
@@ -8145,9 +8170,6 @@ long btrfs_ioctl_send(struct inode *inode, struct btrfs_ioctl_send_args *arg)
 	sctx->orphan_dirs = RB_ROOT;
 	sctx->rbtree_new_refs = RB_ROOT;
 	sctx->rbtree_deleted_refs = RB_ROOT;
-
-	INIT_LIST_HEAD(&sctx->backref_cache.lru_list);
-	mt_init(&sctx->backref_cache.entries);
 
 	sctx->clone_roots = kvcalloc(sizeof(*sctx->clone_roots),
 				     arg->clone_sources_count + 1,

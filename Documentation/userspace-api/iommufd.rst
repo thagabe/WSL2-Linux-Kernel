@@ -13,8 +13,8 @@ Overview
 IOMMUFD is the user API to control the IOMMU subsystem as it relates to managing
 IO page tables from userspace using file descriptors. It intends to be general
 and consumable by any driver that wants to expose DMA to userspace. These
-drivers are eventually expected to deprecate any internal IOMMU logic if exists
-(e.g. vfio_iommu_type1.c).
+drivers are eventually expected to deprecate any internal IOMMU logic
+they may already/historically implement (e.g. vfio_iommu_type1.c).
 
 At minimum iommufd provides universal support of managing I/O address spaces and
 I/O page tables for all IOMMUs, with room in the design to add non-generic
@@ -88,11 +88,11 @@ creating the objects and links::
    on the IOAS must operate equally on each of the iommu_domains inside of it.
 
 2. IOMMUFD_OBJ_DEVICE is created when an external driver calls the IOMMUFD kAPI
-   to bind a device to an iommufd. The driver is expected to implement proper a
-   set of ioctls to allow userspace to initiate the binding operation.
-   Successful completion of this operation establishes the desired DMA ownership
-   over the device. The driver must also set the driver_managed_dma flag and
-   must not touch the device until this operation succeeds.
+   to bind a device to an iommufd. The driver is expected to implement a set of
+   ioctls to allow userspace to initiate the binding operation. Successful
+   completion of this operation establishes the desired DMA ownership over the
+   device. The driver must also set the driver_managed_dma flag and must not
+   touch the device until this operation succeeds.
 
 3. IOMMUFD_OBJ_HW_PAGETABLE is created when an external driver calls the IOMMUFD
    kAPI to attach a bound device to an IOAS. Similarly the external driver uAPI
@@ -112,8 +112,6 @@ creating the objects and links::
 
 A device can only bind to an iommufd due to DMA ownership claim and attach to at
 most one IOAS object (no support of PASID yet).
-
-Currently only PCI device is allowed to use IOMMUFD.
 
 Kernel Datastructure
 --------------------
@@ -145,20 +143,20 @@ iommufd_ioas serves as the metadata datastructure to manage how IOVA ranges are
 mapped to memory pages, composed of:
 
 - struct io_pagetable holding the IOVA map
-- struct iopt_areas representing populated portions of IOVA
+- struct iopt_area's representing populated portions of IOVA
 - struct iopt_pages representing the storage of PFNs
 - struct iommu_domain representing the IO page table in the IOMMU
 - struct iopt_pages_access representing in-kernel users of PFNs
 - struct xarray pinned_pfns holding a list of pages pinned by in-kernel users
 
 Each iopt_pages represents a logical linear array of full PFNs. The PFNs are
-ultimately derived from userspave VAs via an mm_struct. Once they have been
-pinned the PFN is stored in IOPTEs of an iommu_domain or inside the pinned_pages
+ultimately derived from userspace VAs via an mm_struct. Once they have been
+pinned the PFNs are stored in IOPTEs of an iommu_domain or inside the pinned_pfns
 xarray if they have been pinned through an iommufd_access.
 
 PFN have to be copied between all combinations of storage locations, depending
 on what domains are present and what kinds of in-kernel "software access" users
-exists. The mechanism ensures that a page is pinned only once.
+exist. The mechanism ensures that a page is pinned only once.
 
 An io_pagetable is composed of iopt_areas pointing at iopt_pages, along with a
 list of iommu_domains that mirror the IOVA to PFN map.

@@ -312,8 +312,21 @@ config DEBUG_INFO_REDUCED
 	  DEBUG_INFO build and compile times are reduced too.
 	  Only works with newer gcc versions.
 
-config DEBUG_INFO_COMPRESSED
-	bool "Compressed debugging information"
+choice
+	prompt "Compressed Debug information"
+	help
+	  Compress the resulting debug info. Results in smaller debug info sections,
+	  but requires that consumers are able to decompress the results.
+
+	  If unsure, choose DEBUG_INFO_COMPRESSED_NONE.
+
+config DEBUG_INFO_COMPRESSED_NONE
+	bool "Don't compress debug information"
+	help
+	  Don't compress debug info sections.
+
+config DEBUG_INFO_COMPRESSED_ZLIB
+	bool "Compress debugging information with zlib"
 	depends on $(cc-option,-gz=zlib)
 	depends on $(ld-option,--compress-debug-sections=zlib)
 	help
@@ -326,6 +339,18 @@ config DEBUG_INFO_COMPRESSED
 	  recompressed with a different compression scheme. But this is still
 	  preferable to setting $KDEB_COMPRESS to "none" which would be even
 	  larger.
+
+config DEBUG_INFO_COMPRESSED_ZSTD
+	bool "Compress debugging information with zstd"
+	depends on $(cc-option,-gz=zstd)
+	depends on $(ld-option,--compress-debug-sections=zstd)
+	help
+	  Compress the debug information using zstd.  This may provide better
+	  compression than zlib, for about the same time costs, but requires newer
+	  toolchain support.  Requires GCC 13.0+ or Clang 16.0+, binutils 2.40+, and
+	  zstd.
+
+endchoice # "Compressed Debug information"
 
 config DEBUG_INFO_SPLIT
 	bool "Produce split debuginfo in .dwo files"
@@ -399,6 +424,7 @@ config FRAME_WARN
 	default 2048 if GCC_PLUGIN_LATENT_ENTROPY
 	default 2048 if PARISC
 	default 1536 if (!64BIT && XTENSA)
+	default 1280 if KASAN && !64BIT
 	default 1024 if !64BIT
 	default 2048 if 64BIT
 	help
@@ -1512,15 +1538,6 @@ config CSD_LOCK_WAIT_DEBUG
 	  include the IPI handler function currently executing (if any)
 	  and relevant stack traces.
 
-config CSD_LOCK_WAIT_DEBUG_DEFAULT
-	bool "Default csd_lock_wait() debugging on at boot time"
-	depends on CSD_LOCK_WAIT_DEBUG
-	depends on 64BIT
-	default n
-	help
-	  This option causes the csdlock_debug= kernel boot parameter to
-	  default to 1 (basic debugging) instead of 0 (no debugging).
-
 endmenu # lock debugging
 
 config TRACE_IRQFLAGS
@@ -1895,8 +1912,14 @@ config NETDEV_NOTIFIER_ERROR_INJECT
 	  If unsure, say N.
 
 config FUNCTION_ERROR_INJECTION
-	def_bool y
+	bool "Fault-injections of functions"
 	depends on HAVE_FUNCTION_ERROR_INJECTION && KPROBES
+	help
+	  Add fault injections into various functions that are annotated with
+	  ALLOW_ERROR_INJECTION() in the kernel. BPF may also modify the return
+	  value of theses functions. This is useful to test error paths of code.
+
+	  If unsure, say N
 
 config FAULT_INJECTION
 	bool "Fault-injection framework"
@@ -2127,6 +2150,7 @@ config KPROBES_SANITY_TEST
 	depends on DEBUG_KERNEL
 	depends on KPROBES
 	depends on KUNIT
+	select STACKTRACE if ARCH_CORRECT_STACKTRACE_ON_KRETPROBE
 	default KUNIT_ALL_TESTS
 	help
 	  This option provides for testing basic kprobes functionality on
@@ -2259,6 +2283,7 @@ config TEST_XARRAY
 	tristate "Test the XArray code at runtime"
 
 config TEST_MAPLE_TREE
+	depends on DEBUG_KERNEL
 	select DEBUG_MAPLE_TREE
 	tristate "Test the Maple Tree code at runtime"
 
@@ -2766,17 +2791,6 @@ config TEST_CLOCKSOURCE_WATCHDOG
 
 	  If unsure, say N.
 
-config TEST_OBJPOOL
-	tristate "Test module for correctness and stress of objpool"
-	default n
-       depends on m
-	help
-	  This builds the "test_objpool" module that should be used for
-	  correctness verification and concurrent testings of objects
-	  allocation and reclamation.
-
-	  If unsure, say N.
-
 endif # RUNTIME_TESTING_MENU
 
 config ARCH_USE_MEMTEST
@@ -2839,6 +2853,22 @@ config RUST_OVERFLOW_CHECKS
 	  Note that this will apply to all Rust code, including `core`.
 
 	  If unsure, say Y.
+
+config RUST_BUILD_ASSERT_ALLOW
+	bool "Allow unoptimized build-time assertions"
+	depends on RUST
+	help
+	  Controls how are `build_error!` and `build_assert!` handled during build.
+
+	  If calls to them exist in the binary, it may indicate a violated invariant
+	  or that the optimizer failed to verify the invariant during compilation.
+
+	  This should not happen, thus by default the build is aborted. However,
+	  as an escape hatch, you can choose Y here to ignore them during build
+	  and let the check be carried at runtime (with `panic!` being called if
+	  the check fails).
+
+	  If unsure, say N.
 
 endmenu # "Rust"
 

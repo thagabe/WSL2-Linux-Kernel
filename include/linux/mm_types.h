@@ -104,7 +104,10 @@ struct page {
 			};
 			/* See page-flags.h for PAGE_MAPPING_FLAGS */
 			struct address_space *mapping;
-			pgoff_t index;		/* Our offset within mapping. */
+			union {
+				pgoff_t index;		/* Our offset within mapping. */
+				unsigned long share;	/* share count for fsdax */
+			};
 			/**
 			 * @private: Mapping-private opaque data.
 			 * Usually used for buffer_heads if PagePrivate.
@@ -251,7 +254,7 @@ struct page {
 #endif
 } _struct_page_alignment;
 
-/**
+/*
  * struct encoded_page - a nonexistent type marking this pointer
  *
  * An 'encoded_page' pointer is a pointer to a regular 'struct page', but
@@ -971,18 +974,18 @@ enum vm_fault_reason {
 			VM_FAULT_HWPOISON_LARGE | VM_FAULT_FALLBACK)
 
 #define VM_FAULT_RESULT_TRACE \
-	{ (__force unsigned int) VM_FAULT_OOM,                 "OOM" },	\
-	{ (__force unsigned int) VM_FAULT_SIGBUS,              "SIGBUS" },	\
-	{ (__force unsigned int) VM_FAULT_MAJOR,               "MAJOR" },	\
-	{ (__force unsigned int) VM_FAULT_HWPOISON,            "HWPOISON" },	\
-	{ (__force unsigned int) VM_FAULT_HWPOISON_LARGE,      "HWPOISON_LARGE" },	\
-	{ (__force unsigned int) VM_FAULT_SIGSEGV,             "SIGSEGV" },	\
-	{ (__force unsigned int) VM_FAULT_NOPAGE,              "NOPAGE" },	\
-	{ (__force unsigned int) VM_FAULT_LOCKED,              "LOCKED" },	\
-	{ (__force unsigned int) VM_FAULT_RETRY,               "RETRY" },	\
-	{ (__force unsigned int) VM_FAULT_FALLBACK,            "FALLBACK" },	\
-	{ (__force unsigned int) VM_FAULT_DONE_COW,            "DONE_COW" },	\
-	{ (__force unsigned int) VM_FAULT_NEEDDSYNC,           "NEEDDSYNC" }
+	{ VM_FAULT_OOM,                 "OOM" },	\
+	{ VM_FAULT_SIGBUS,              "SIGBUS" },	\
+	{ VM_FAULT_MAJOR,               "MAJOR" },	\
+	{ VM_FAULT_HWPOISON,            "HWPOISON" },	\
+	{ VM_FAULT_HWPOISON_LARGE,      "HWPOISON_LARGE" },	\
+	{ VM_FAULT_SIGSEGV,             "SIGSEGV" },	\
+	{ VM_FAULT_NOPAGE,              "NOPAGE" },	\
+	{ VM_FAULT_LOCKED,              "LOCKED" },	\
+	{ VM_FAULT_RETRY,               "RETRY" },	\
+	{ VM_FAULT_FALLBACK,            "FALLBACK" },	\
+	{ VM_FAULT_DONE_COW,            "DONE_COW" },	\
+	{ VM_FAULT_NEEDDSYNC,           "NEEDDSYNC" }
 
 struct vm_special_mapping {
 	const char *name;	/* The name, e.g. "[vdso]". */

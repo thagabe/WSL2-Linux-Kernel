@@ -3498,7 +3498,7 @@ void tty_default_fops(struct file_operations *fops)
 	*fops = tty_fops;
 }
 
-static char *tty_devnode(struct device *dev, umode_t *mode)
+static char *tty_devnode(const struct device *dev, umode_t *mode)
 {
 	if (!mode)
 		return NULL;
@@ -3530,7 +3530,14 @@ static ssize_t show_cons_active(struct device *dev,
 	struct console *c;
 	ssize_t count = 0;
 
-	console_lock();
+	/*
+	 * Hold the console_list_lock to guarantee that no consoles are
+	 * unregistered until all console processing is complete.
+	 * This also allows safe traversal of the console list and
+	 * race-free reading of @flags.
+	 */
+	console_list_lock();
+
 	for_each_console(c) {
 		if (!c->device)
 			continue;
@@ -3542,6 +3549,13 @@ static ssize_t show_cons_active(struct device *dev,
 		if (i >= ARRAY_SIZE(cs))
 			break;
 	}
+
+	/*
+	 * Take console_lock to serialize device() callback with
+	 * other console operations. For example, fg_console is
+	 * modified under console_lock when switching vt.
+	 */
+	console_lock();
 	while (i--) {
 		int index = cs[i]->index;
 		struct tty_driver *drv = cs[i]->device(cs[i], &index);
@@ -3556,6 +3570,8 @@ static ssize_t show_cons_active(struct device *dev,
 		count += sprintf(buf + count, "%c", i ? ' ':'\n');
 	}
 	console_unlock();
+
+	console_list_unlock();
 
 	return count;
 }

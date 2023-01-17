@@ -314,7 +314,9 @@ void perf_session__delete(struct perf_session *session)
 			evlist__delete(session->evlist);
 		perf_data__close(session->data);
 	}
+#ifdef HAVE_LIBTRACEEVENT
 	trace_event__cleanup(&session->tevent);
+#endif
 	free(session);
 }
 
@@ -2749,7 +2751,7 @@ int perf_session__cpu_bitmap(struct perf_session *session,
 			goto out_delete_map;
 		}
 
-		set_bit(cpu.cpu, cpu_bitmap);
+		__set_bit(cpu.cpu, cpu_bitmap);
 	}
 
 	err = 0;

@@ -306,15 +306,15 @@ TEST_F(iommufd_ioas, area)
 				  PAGE_SIZE);
 
 	/* Over map fails */
-	test_err_ioctl_ioas_map_fixed(EADDRINUSE, buffer, PAGE_SIZE * 2,
+	test_err_ioctl_ioas_map_fixed(EEXIST, buffer, PAGE_SIZE * 2,
 				      self->base_iova + 16 * PAGE_SIZE);
-	test_err_ioctl_ioas_map_fixed(EADDRINUSE, buffer, PAGE_SIZE,
+	test_err_ioctl_ioas_map_fixed(EEXIST, buffer, PAGE_SIZE,
 				      self->base_iova + 16 * PAGE_SIZE);
-	test_err_ioctl_ioas_map_fixed(EADDRINUSE, buffer, PAGE_SIZE,
+	test_err_ioctl_ioas_map_fixed(EEXIST, buffer, PAGE_SIZE,
 				      self->base_iova + 17 * PAGE_SIZE);
-	test_err_ioctl_ioas_map_fixed(EADDRINUSE, buffer, PAGE_SIZE * 2,
+	test_err_ioctl_ioas_map_fixed(EEXIST, buffer, PAGE_SIZE * 2,
 				      self->base_iova + 15 * PAGE_SIZE);
-	test_err_ioctl_ioas_map_fixed(EADDRINUSE, buffer, PAGE_SIZE * 3,
+	test_err_ioctl_ioas_map_fixed(EEXIST, buffer, PAGE_SIZE * 3,
 				      self->base_iova + 15 * PAGE_SIZE);
 
 	/* unmap all works */
@@ -1101,6 +1101,33 @@ TEST_F(iommufd_mock_domain, basic)
 	/* EFAULT on first page */
 	ASSERT_EQ(0, munmap(buf, buf_size / 2));
 	test_err_ioctl_ioas_map(EFAULT, buf, buf_size, &iova);
+}
+
+TEST_F(iommufd_mock_domain, ro_unshare)
+{
+	uint8_t *buf;
+	__u64 iova;
+	int fd;
+
+	fd = open("/proc/self/exe", O_RDONLY);
+	ASSERT_NE(-1, fd);
+
+	buf = mmap(0, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+	ASSERT_NE(MAP_FAILED, buf);
+	close(fd);
+
+	/*
+	 * There have been lots of changes to the "unshare" mechanism in
+	 * get_user_pages(), make sure it works right. The write to the page
+	 * after we map it for reading should not change the assigned PFN.
+	 */
+	ASSERT_EQ(0,
+		  _test_ioctl_ioas_map(self->fd, self->ioas_id, buf, PAGE_SIZE,
+				       &iova, IOMMU_IOAS_MAP_READABLE));
+	check_mock_iova(buf, iova, PAGE_SIZE);
+	memset(buf, 1, PAGE_SIZE);
+	check_mock_iova(buf, iova, PAGE_SIZE);
+	ASSERT_EQ(0, munmap(buf, PAGE_SIZE));
 }
 
 TEST_F(iommufd_mock_domain, all_aligns)

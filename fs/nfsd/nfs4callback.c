@@ -76,6 +76,17 @@ static __be32 *xdr_encode_empty_array(__be32 *p)
  * 1 Protocol"
  */
 
+static void encode_uint32(struct xdr_stream *xdr, u32 n)
+{
+	WARN_ON_ONCE(xdr_stream_encode_u32(xdr, n) < 0);
+}
+
+static void encode_bitmap4(struct xdr_stream *xdr, const __u32 *bitmap,
+			   size_t len)
+{
+	WARN_ON_ONCE(xdr_stream_encode_uint32_array(xdr, bitmap, len) < 0);
+}
+
 /*
  *	nfs_cb_opnum4
  *
@@ -341,9 +352,8 @@ encode_cb_recallany4args(struct xdr_stream *xdr,
 	struct nfs4_cb_compound_hdr *hdr, struct nfsd4_cb_recall_any *ra)
 {
 	encode_nfs_cb_opnum4(xdr, OP_CB_RECALL_ANY);
-	xdr_stream_encode_u32(xdr, ra->ra_keep);
-	xdr_stream_encode_uint32_array(xdr, ra->ra_bmval,
-				       ARRAY_SIZE(ra->ra_bmval));
+	encode_uint32(xdr, ra->ra_keep);
+	encode_bitmap4(xdr, ra->ra_bmval, ARRAY_SIZE(ra->ra_bmval));
 	hdr->nops++;
 }
 
@@ -978,7 +988,6 @@ static int setup_callback_client(struct nfs4_client *clp, struct nfs4_cb_conn *c
 	} else {
 		if (!conn->cb_xprt)
 			return -EINVAL;
-		clp->cl_cb_conn.cb_xprt = conn->cb_xprt;
 		clp->cl_cb_session = ses;
 		args.bc_xprt = conn->cb_xprt;
 		args.prognumber = clp->cl_cb_session->se_cb_prog;
@@ -998,6 +1007,9 @@ static int setup_callback_client(struct nfs4_client *clp, struct nfs4_cb_conn *c
 		rpc_shutdown_client(client);
 		return -ENOMEM;
 	}
+
+	if (clp->cl_minorversion != 0)
+		clp->cl_cb_conn.cb_xprt = conn->cb_xprt;
 	clp->cl_cb_client = client;
 	clp->cl_cb_cred = cred;
 	rcu_read_lock();

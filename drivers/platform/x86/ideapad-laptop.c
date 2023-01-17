@@ -134,6 +134,7 @@ struct ideapad_private {
 	struct ideapad_dytc_priv *dytc;
 	struct dentry *debug;
 	unsigned long cfg;
+	unsigned long r_touchpad_val;
 	struct {
 		bool conservation_mode    : 1;
 		bool dytc                 : 1;
@@ -143,6 +144,7 @@ struct ideapad_private {
 		bool hw_rfkill_switch     : 1;
 		bool kbd_bl               : 1;
 		bool touchpad_ctrl_via_ec : 1;
+		bool ctrl_ps2_aux_port    : 1;
 		bool usb_charging         : 1;
 	} features;
 	struct {
@@ -173,6 +175,18 @@ module_param(set_fn_lock_led, bool, 0444);
 MODULE_PARM_DESC(set_fn_lock_led,
 	"Enable driver based updates of the fn-lock LED on fn-lock changes. "
 	"If you need this please report this to: platform-driver-x86@vger.kernel.org");
+
+static bool ctrl_ps2_aux_port;
+module_param(ctrl_ps2_aux_port, bool, 0444);
+MODULE_PARM_DESC(ctrl_ps2_aux_port,
+	"Enable driver based PS/2 aux port en-/dis-abling on touchpad on/off toggle. "
+	"If you need this please report this to: platform-driver-x86@vger.kernel.org");
+
+static bool touchpad_ctrl_via_ec;
+module_param(touchpad_ctrl_via_ec, bool, 0444);
+MODULE_PARM_DESC(touchpad_ctrl_via_ec,
+	"Enable registering a 'touchpad' sysfs-attribute which can be used to manually "
+	"tell the EC to enable/disable the touchpad. This may not work on all models.");
 
 /*
  * shared data
@@ -643,6 +657,8 @@ static ssize_t touchpad_show(struct device *dev,
 	if (err)
 		return err;
 
+	priv->r_touchpad_val = result;
+
 	return sysfs_emit(buf, "%d\n", !!result);
 }
 
@@ -661,6 +677,8 @@ static ssize_t touchpad_store(struct device *dev,
 	err = write_ec_cmd(priv->adev->handle, VPCCMD_W_TOUCHPAD, state);
 	if (err)
 		return err;
+
+	priv->r_touchpad_val = state;
 
 	return count;
 }
@@ -1152,6 +1170,7 @@ static const struct key_entry ideapad_keymap[] = {
 	{ KE_KEY,  65, { KEY_PROG4 } },
 	{ KE_KEY,  66, { KEY_TOUCHPAD_OFF } },
 	{ KE_KEY,  67, { KEY_TOUCHPAD_ON } },
+	{ KE_KEY,  68, { KEY_TOUCHPAD_TOGGLE } },
 	{ KE_KEY, 128, { KEY_ESC } },
 
 	/*
@@ -1487,26 +1506,41 @@ static void ideapad_kbd_bl_exit(struct ideapad_private *priv)
 /*
  * module init/exit
  */
-static void ideapad_sync_touchpad_state(struct ideapad_private *priv)
+static void ideapad_sync_touchpad_state(struct ideapad_private *priv, bool send_events)
 {
 	unsigned long value;
-
-	if (!priv->features.touchpad_ctrl_via_ec)
-		return;
+	unsigned char param;
+	int ret;
 
 	/* Without reading from EC touchpad LED doesn't switch state */
-	if (!read_ec_data(priv->adev->handle, VPCCMD_R_TOUCHPAD, &value)) {
-		unsigned char param;
-		/*
-		 * Some IdeaPads don't really turn off touchpad - they only
-		 * switch the LED state. We (de)activate KBC AUX port to turn
-		 * touchpad off and on. We send KEY_TOUCHPAD_OFF and
-		 * KEY_TOUCHPAD_ON to not to get out of sync with LED
-		 */
+	ret = read_ec_data(priv->adev->handle, VPCCMD_R_TOUCHPAD, &value);
+	if (ret)
+		return;
+
+	/*
+	 * Some IdeaPads don't really turn off touchpad - they only
+	 * switch the LED state. We (de)activate KBC AUX port to turn
+	 * touchpad off and on. We send KEY_TOUCHPAD_OFF and
+	 * KEY_TOUCHPAD_ON to not to get out of sync with LED
+	 */
+	if (priv->features.ctrl_ps2_aux_port)
 		i8042_command(&param, value ? I8042_CMD_AUX_ENABLE : I8042_CMD_AUX_DISABLE);
-		ideapad_input_report(priv, value ? 67 : 66);
-		sysfs_notify(&priv->platform_device->dev.kobj, NULL, "touchpad");
+
+	if (send_events) {
+		/*
+		 * On older models the EC controls the touchpad and toggles it
+		 * on/off itself, in this case we report KEY_TOUCHPAD_ON/_OFF.
+		 * If the EC did not toggle, report KEY_TOUCHPAD_TOGGLE.
+		 */
+		if (value != priv->r_touchpad_val) {
+			ideapad_input_report(priv, value ? 67 : 66);
+			sysfs_notify(&priv->platform_device->dev.kobj, NULL, "touchpad");
+		} else {
+			ideapad_input_report(priv, 68);
+		}
 	}
+
+	priv->r_touchpad_val = value;
 }
 
 static void ideapad_acpi_notify(acpi_handle handle, u32 event, void *data)
@@ -1547,7 +1581,7 @@ static void ideapad_acpi_notify(acpi_handle handle, u32 event, void *data)
 			ideapad_sync_rfk_state(priv);
 			break;
 		case 5:
-			ideapad_sync_touchpad_state(priv);
+			ideapad_sync_touchpad_state(priv, true);
 			break;
 		case 4:
 			ideapad_backlight_notify_brightness(priv);
@@ -1587,6 +1621,12 @@ static const struct dmi_system_id set_fn_lock_led_list[] = {
 			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Legion R7000P2020H"),
 		}
 	},
+	{
+		.matches = {
+			DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
+			DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo Legion 5 15ARH05"),
+		}
+	},
 	{}
 };
 
@@ -1609,19 +1649,18 @@ static const struct dmi_system_id hw_rfkill_list[] = {
 	{}
 };
 
-static const struct dmi_system_id no_touchpad_switch_list[] = {
+/*
+ * On some models the EC toggles the touchpad muted LED on touchpad toggle
+ * hotkey presses, but the EC does not actually disable the touchpad itself.
+ * On these models the driver needs to explicitly enable/disable the i8042
+ * (PS/2) aux port.
+ */
+static const struct dmi_system_id ctrl_ps2_aux_port_list[] = {
 	{
-	.ident = "Lenovo Yoga 3 Pro 1370",
+	/* Lenovo Ideapad Z570 */
 	.matches = {
 		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-		DMI_MATCH(DMI_PRODUCT_VERSION, "Lenovo YOGA 3"),
-		},
-	},
-	{
-	.ident = "ZhaoYang K4e-IML",
-	.matches = {
-		DMI_MATCH(DMI_SYS_VENDOR, "LENOVO"),
-		DMI_MATCH(DMI_PRODUCT_VERSION, "ZhaoYang K4e-IML"),
+		DMI_MATCH(DMI_PRODUCT_VERSION, "Ideapad Z570"),
 		},
 	},
 	{}
@@ -1636,14 +1675,9 @@ static void ideapad_check_features(struct ideapad_private *priv)
 		set_fn_lock_led || dmi_check_system(set_fn_lock_led_list);
 	priv->features.hw_rfkill_switch =
 		hw_rfkill_switch || dmi_check_system(hw_rfkill_list);
-
-	/* Most ideapads with ELAN0634 touchpad don't use EC touchpad switch */
-	if (acpi_dev_present("ELAN0634", NULL, -1))
-		priv->features.touchpad_ctrl_via_ec = 0;
-	else if (dmi_check_system(no_touchpad_switch_list))
-		priv->features.touchpad_ctrl_via_ec = 0;
-	else
-		priv->features.touchpad_ctrl_via_ec = 1;
+	priv->features.ctrl_ps2_aux_port =
+		ctrl_ps2_aux_port || dmi_check_system(ctrl_ps2_aux_port_list);
+	priv->features.touchpad_ctrl_via_ec = touchpad_ctrl_via_ec;
 
 	if (!read_ec_data(handle, VPCCMD_R_FAN, &val))
 		priv->features.fan_mode = true;
@@ -1828,16 +1862,12 @@ static int ideapad_acpi_add(struct platform_device *pdev)
 	if (!priv->features.hw_rfkill_switch)
 		write_ec_cmd(priv->adev->handle, VPCCMD_W_RF, 1);
 
-	/* The same for Touchpad */
-	if (!priv->features.touchpad_ctrl_via_ec)
-		write_ec_cmd(priv->adev->handle, VPCCMD_W_TOUCHPAD, 1);
-
 	for (i = 0; i < IDEAPAD_RFKILL_DEV_NUM; i++)
 		if (test_bit(ideapad_rfk_data[i].cfgbit, &priv->cfg))
 			ideapad_register_rfkill(priv, i);
 
 	ideapad_sync_rfk_state(priv);
-	ideapad_sync_touchpad_state(priv);
+	ideapad_sync_touchpad_state(priv, false);
 
 	err = ideapad_dytc_profile_init(priv);
 	if (err) {
@@ -1922,7 +1952,7 @@ static int ideapad_acpi_resume(struct device *dev)
 	struct ideapad_private *priv = dev_get_drvdata(dev);
 
 	ideapad_sync_rfk_state(priv);
-	ideapad_sync_touchpad_state(priv);
+	ideapad_sync_touchpad_state(priv, false);
 
 	if (priv->dytc)
 		dytc_profile_refresh(priv);

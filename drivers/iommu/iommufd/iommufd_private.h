@@ -22,7 +22,7 @@ struct iommufd_ctx {
 };
 
 /*
- * The IOVA to PFN map. The mapper automatically copies the PFNs into multiple
+ * The IOVA to PFN map. The map automatically copies the PFNs into multiple
  * domains and permits sharing of PFNs between io_pagetable instances. This
  * supports both a design where IOAS's are 1:1 with a domain (eg because the
  * domain is HW customized), or where the IOAS is 1:N with multiple generic
@@ -160,8 +160,8 @@ static inline void iommufd_put_object(struct iommufd_object *obj)
  * a system call return. So cases that have longer term needs must switch
  * to the weaker users refcount_t.
  *
- * With users protection iommufd_object_destroy_user() will return -EBUSY to
- * userspace and refuse to destroy the object.
+ * With users protection iommufd_object_destroy_user() will return false,
+ * refusing to destroy the object, causing -EBUSY to userspace.
  */
 static inline void iommufd_ref_to_users(struct iommufd_object *obj)
 {

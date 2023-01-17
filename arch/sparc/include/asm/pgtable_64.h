@@ -693,6 +693,7 @@ static inline unsigned long pmd_dirty(pmd_t pmd)
 	return pte_dirty(pte);
 }
 
+#define pmd_young pmd_young
 static inline unsigned long pmd_young(pmd_t pmd)
 {
 	pte_t pte = __pte(pmd_val(pmd));
@@ -1052,7 +1053,7 @@ static inline unsigned long __untagged_addr(unsigned long start)
 
 	return start;
 }
-#define untagged_addr(mm, addr) \
+#define untagged_addr(addr) \
 	((__typeof__(addr))(__untagged_addr((unsigned long)(addr))))
 
 static inline bool pte_access_permitted(pte_t pte, bool write)

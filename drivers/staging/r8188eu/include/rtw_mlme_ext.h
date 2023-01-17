@@ -431,9 +431,9 @@ void update_network(struct wlan_bssid_ex *dst, struct wlan_bssid_ex *src,
 u8 *get_my_bssid(struct wlan_bssid_ex *pnetwork);
 u16 get_beacon_interval(struct wlan_bssid_ex *bss);
 
-bool is_client_associated_to_ap(struct adapter *padapter);
-bool is_client_associated_to_ibss(struct adapter *padapter);
-bool is_IBSS_empty(struct adapter *padapter);
+bool r8188eu_is_client_associated_to_ap(struct adapter *padapter);
+bool r8188eu_is_client_associated_to_ibss(struct adapter *padapter);
+bool r8188eu_is_ibss_empty(struct adapter *padapter);
 
 unsigned char check_assoc_AP(u8 *pframe, uint len);
 
@@ -447,8 +447,7 @@ void HTOnAssocRsp(struct adapter *padapter);
 void ERP_IE_handler(struct adapter *padapter, struct ndis_802_11_var_ie *pIE);
 void VCS_update(struct adapter *padapter, struct sta_info *psta);
 
-void update_beacon_info(struct adapter *padapter, u8 *pframe, uint len,
-			struct sta_info *psta);
+void update_beacon_info(struct adapter *padapter, u8 *ie_ptr, uint ie_len, struct sta_info *psta);
 int rtw_check_bcn_info(struct adapter  *Adapter, u8 *pframe, u32 packet_len);
 void update_IOT_info(struct adapter *padapter);
 void update_capinfo(struct adapter *adapter, u16 updatecap);
@@ -498,7 +497,7 @@ void issue_probersp_p2p(struct adapter *padapter, unsigned char *da);
 void issue_p2p_provision_request(struct adapter *padapter, u8 *pssid,
 				 u8 ussidlen, u8 *pdev_raddr);
 void issue_p2p_GO_request(struct adapter *padapter, u8 *raddr);
-void issue_probereq_p2p(struct adapter *padapter, u8 *da);
+void issue_probereq_p2p(struct adapter *padapter);
 void issue_p2p_invitation_response(struct adapter *padapter, u8 *raddr,
 				   u8 dialogToken, u8 success);
 void issue_p2p_invitation_request(struct adapter *padapter, u8 *raddr);
@@ -512,8 +511,7 @@ void issue_auth(struct adapter *padapter, struct sta_info *psta,
 		unsigned short status);
 void issue_probereq(struct adapter *padapter, struct ndis_802_11_ssid *pssid,
 		    u8 *da);
-s32 issue_probereq_ex(struct adapter *adapter, struct ndis_802_11_ssid *pssid,
-		      u8 *da, int try_cnt, int wait_ms);
+void issue_probereq_ex(struct adapter *padapter, struct ndis_802_11_ssid *pssid, u8 *da);
 int issue_nulldata(struct adapter *padapter, unsigned char *da,
 		   unsigned int power_mode, int try_cnt, int wait_ms);
 int issue_qos_nulldata(struct adapter *padapter, unsigned char *da,

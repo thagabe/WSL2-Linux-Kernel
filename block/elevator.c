@@ -57,7 +57,7 @@ static LIST_HEAD(elv_list);
  * Query io scheduler to see if the current process issuing bio may be
  * merged with rq.
  */
-static int elv_iosched_allow_bio_merge(struct request *rq, struct bio *bio)
+static bool elv_iosched_allow_bio_merge(struct request *rq, struct bio *bio)
 {
 	struct request_queue *q = rq->q;
 	struct elevator_queue *e = q->elevator;
@@ -65,7 +65,7 @@ static int elv_iosched_allow_bio_merge(struct request *rq, struct bio *bio)
 	if (e->type->ops.allow_merge)
 		return e->type->ops.allow_merge(q, rq, bio);
 
-	return 1;
+	return true;
 }
 
 /*
@@ -91,12 +91,11 @@ static inline bool elv_support_features(struct request_queue *q,
 }
 
 /**
- * elevator_match - Test an elevator name and features
+ * elevator_match - Check whether @e's name or alias matches @name
  * @e: Scheduler to test
  * @name: Elevator name to test
  *
- * Return true if the elevator @e name matches @name and if @e provides all
- * the features specified by @required_features.
+ * Return true if the elevator @e's name or alias matches @name.
  */
 static bool elevator_match(const struct elevator_type *e, const char *name)
 {
@@ -468,7 +467,7 @@ int elv_register_queue(struct request_queue *q, bool uevent)
 
 	lockdep_assert_held(&q->sysfs_lock);
 
-	error = kobject_add(&e->kobj, &q->kobj, "%s", "iosched");
+	error = kobject_add(&e->kobj, &q->disk->queue_kobj, "iosched");
 	if (!error) {
 		struct elv_fs_entry *attr = e->type->elevator_attrs;
 		if (attr) {
@@ -650,10 +649,10 @@ void elevator_init_mq(struct request_queue *q)
 }
 
 /*
- * switch to new_e io scheduler. be careful not to introduce deadlocks -
- * we don't free the old io scheduler, before we have allocated what we
- * need for the new one. this way we have a chance of going back to the old
- * one, if the new one fails init for some reason.
+ * Switch to new_e io scheduler.
+ *
+ * If switching fails, we are most likely running out of memory and not able
+ * to restore the old io scheduler, so leaving the io scheduler being none.
  */
 int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
 {
@@ -683,6 +682,12 @@ int elevator_switch(struct request_queue *q, struct elevator_type *new_e)
 out_unfreeze:
 	blk_mq_unquiesce_queue(q);
 	blk_mq_unfreeze_queue(q);
+
+	if (ret) {
+		pr_warn("elv: switch to \"%s\" failed, falling back to \"none\"\n",
+			new_e->elevator_name);
+	}
+
 	return ret;
 }
 
@@ -716,9 +721,6 @@ static int elevator_change(struct request_queue *q, const char *elevator_name)
 	if (!blk_queue_registered(q))
 		return -ENOENT;
 
-	/*
-	 * Special case for mq, turn off scheduling
-	 */
 	if (!strncmp(elevator_name, "none", 4)) {
 		if (q->elevator)
 			elevator_disable(q);
@@ -765,26 +767,23 @@ ssize_t elv_iosched_show(struct request_queue *q, char *name)
 	if (!elv_support_iosched(q))
 		return sprintf(name, "none\n");
 
-	if (!q->elevator)
+	if (!q->elevator) {
 		len += sprintf(name+len, "[none] ");
-	else
+	} else {
+		len += sprintf(name+len, "none ");
 		cur = eq->type;
+	}
 
 	spin_lock(&elv_list_lock);
 	list_for_each_entry(e, &elv_list, list) {
-		if (e == cur) {
-			len += sprintf(name+len, "[%s] ", cur->elevator_name);
-			continue;
-		}
-		if (elv_support_features(q, e))
+		if (e == cur)
+			len += sprintf(name+len, "[%s] ", e->elevator_name);
+		else if (elv_support_features(q, e))
 			len += sprintf(name+len, "%s ", e->elevator_name);
 	}
 	spin_unlock(&elv_list_lock);
 
-	if (q->elevator)
-		len += sprintf(name+len, "none");
-
-	len += sprintf(len+name, "\n");
+	len += sprintf(name+len, "\n");
 	return len;
 }
 

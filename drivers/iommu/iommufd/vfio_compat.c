@@ -156,8 +156,8 @@ static int iommufd_vfio_unmap_dma(struct iommufd_ctx *ictx, unsigned int cmd,
 	 */
 	u32 supported_flags = VFIO_DMA_UNMAP_FLAG_ALL;
 	struct vfio_iommu_type1_dma_unmap unmap;
+	unsigned long unmapped = 0;
 	struct iommufd_ioas *ioas;
-	unsigned long unmapped;
 	int rc;
 
 	if (copy_from_user(&unmap, arg, minsz))
@@ -178,6 +178,11 @@ static int iommufd_vfio_unmap_dma(struct iommufd_ctx *ictx, unsigned int cmd,
 		rc = iopt_unmap_all(&ioas->iopt, &unmapped);
 	} else {
 		if (READ_ONCE(ioas->iopt.disable_large_pages)) {
+			/*
+			 * Create cuts at the start and last of the requested
+			 * range. If the start IOVA is 0 then it doesn't need to
+			 * be cut.
+			 */
 			unsigned long iovas[] = { unmap.iova + unmap.size - 1,
 						  unmap.iova - 1 };
 
@@ -266,6 +271,15 @@ static int iommufd_vfio_set_iommu(struct iommufd_ctx *ictx, unsigned long type)
 	ioas = get_compat_ioas(ictx);
 	if (IS_ERR(ioas))
 		return PTR_ERR(ioas);
+
+	/*
+	 * The difference between TYPE1 and TYPE1v2 is the ability to unmap in
+	 * the middle of mapped ranges. This is complicated by huge page support
+	 * which creates single large IOPTEs that cannot be split by the iommu
+	 * driver. TYPE1 is very old at this point and likely nothing uses it,
+	 * however it is simple enough to emulate by simply disabling the
+	 * problematic large IOPTEs. Then we can safely unmap within any range.
+	 */
 	if (type == VFIO_TYPE1_IOMMU)
 		rc = iopt_disable_large_pages(&ioas->iopt);
 	iommufd_put_object(&ioas->obj);
@@ -339,8 +353,14 @@ static int iommufd_fill_cap_dma_avail(struct iommufd_ioas *ioas,
 			.id = VFIO_IOMMU_TYPE1_INFO_DMA_AVAIL,
 			.version = 1,
 		},
-		/* iommufd has no limit, return the same value as VFIO. */
-		.avail = U16_MAX,
+		/*
+		 * iommufd's limit is based on the cgroup's memory limit.
+		 * Normally vfio would return U16_MAX here, and provide a module
+		 * parameter to adjust it. Since S390 qemu userspace actually
+		 * pays attention and needs a value bigger than U16_MAX return
+		 * U32_MAX.
+		 */
+		.avail = U32_MAX,
 	};
 
 	if (avail >= sizeof(cap_dma) &&

@@ -160,7 +160,7 @@ static int mock_domain_map_pages(struct iommu_domain *domain,
 			old = xa_store(&mock->pfns, iova / MOCK_IO_PAGE_SIZE,
 				       xa_mk_value((paddr / MOCK_IO_PAGE_SIZE) |
 						   flags),
-				       GFP_KERNEL);
+				       gfp);
 			if (xa_is_err(old)) {
 				for (; start_iova != iova;
 				     start_iova += MOCK_IO_PAGE_SIZE)

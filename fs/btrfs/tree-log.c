@@ -29,6 +29,7 @@
 #include "file-item.h"
 #include "file.h"
 #include "orphan.h"
+#include "tree-checker.h"
 
 #define MAX_CONFLICT_INODES 10
 
@@ -364,11 +365,25 @@ static int process_one_buffer(struct btrfs_root *log,
 	return ret;
 }
 
-static int do_overwrite_item(struct btrfs_trans_handle *trans,
-			     struct btrfs_root *root,
-			     struct btrfs_path *path,
-			     struct extent_buffer *eb, int slot,
-			     struct btrfs_key *key)
+/*
+ * Item overwrite used by replay and tree logging.  eb, slot and key all refer
+ * to the src data we are copying out.
+ *
+ * root is the tree we are copying into, and path is a scratch
+ * path for use in this function (it should be released on entry and
+ * will be released on exit).
+ *
+ * If the key is already in the destination tree the existing item is
+ * overwritten.  If the existing item isn't big enough, it is extended.
+ * If it is too large, it is truncated.
+ *
+ * If the key isn't in the destination yet, a new item is inserted.
+ */
+static int overwrite_item(struct btrfs_trans_handle *trans,
+			  struct btrfs_root *root,
+			  struct btrfs_path *path,
+			  struct extent_buffer *eb, int slot,
+			  struct btrfs_key *key)
 {
 	int ret;
 	u32 item_size;
@@ -376,31 +391,24 @@ static int do_overwrite_item(struct btrfs_trans_handle *trans,
 	int save_old_i_size = 0;
 	unsigned long src_ptr;
 	unsigned long dst_ptr;
-	int overwrite_root = 0;
 	bool inode_item = key->type == BTRFS_INODE_ITEM_KEY;
 
-	if (root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID)
-		overwrite_root = 1;
+	/*
+	 * This is only used during log replay, so the root is always from a
+	 * fs/subvolume tree. In case we ever need to support a log root, then
+	 * we'll have to clone the leaf in the path, release the path and use
+	 * the leaf before writing into the log tree. See the comments at
+	 * copy_items() for more details.
+	 */
+	ASSERT(root->root_key.objectid != BTRFS_TREE_LOG_OBJECTID);
 
 	item_size = btrfs_item_size(eb, slot);
 	src_ptr = btrfs_item_ptr_offset(eb, slot);
 
-	/* Our caller must have done a search for the key for us. */
-	ASSERT(path->nodes[0] != NULL);
-
-	/*
-	 * And the slot must point to the exact key or the slot where the key
-	 * should be at (the first item with a key greater than 'key')
-	 */
-	if (path->slots[0] < btrfs_header_nritems(path->nodes[0])) {
-		struct btrfs_key found_key;
-
-		btrfs_item_key_to_cpu(path->nodes[0], &found_key, path->slots[0]);
-		ret = btrfs_comp_cpu_keys(&found_key, key);
-		ASSERT(ret >= 0);
-	} else {
-		ret = 1;
-	}
+	/* Look for the key in the destination tree. */
+	ret = btrfs_search_slot(NULL, root, key, path, 0, 0);
+	if (ret < 0)
+		return ret;
 
 	if (ret == 0) {
 		char *src_copy;
@@ -545,8 +553,7 @@ insert:
 			goto no_copy;
 		}
 
-		if (overwrite_root &&
-		    S_ISDIR(btrfs_inode_mode(eb, src_item)) &&
+		if (S_ISDIR(btrfs_inode_mode(eb, src_item)) &&
 		    S_ISDIR(btrfs_inode_mode(path->nodes[0], dst_item))) {
 			save_old_i_size = 1;
 			saved_i_size = btrfs_inode_size(path->nodes[0],
@@ -576,36 +583,6 @@ no_copy:
 	btrfs_mark_buffer_dirty(path->nodes[0]);
 	btrfs_release_path(path);
 	return 0;
-}
-
-/*
- * Item overwrite used by replay and tree logging.  eb, slot and key all refer
- * to the src data we are copying out.
- *
- * root is the tree we are copying into, and path is a scratch
- * path for use in this function (it should be released on entry and
- * will be released on exit).
- *
- * If the key is already in the destination tree the existing item is
- * overwritten.  If the existing item isn't big enough, it is extended.
- * If it is too large, it is truncated.
- *
- * If the key isn't in the destination yet, a new item is inserted.
- */
-static int overwrite_item(struct btrfs_trans_handle *trans,
-			  struct btrfs_root *root,
-			  struct btrfs_path *path,
-			  struct extent_buffer *eb, int slot,
-			  struct btrfs_key *key)
-{
-	int ret;
-
-	/* Look for the key in the destination tree. */
-	ret = btrfs_search_slot(NULL, root, key, path, 0, 0);
-	if (ret < 0)
-		return ret;
-
-	return do_overwrite_item(trans, root, path, eb, slot, key);
 }
 
 static int read_alloc_one_name(struct extent_buffer *eb, void *start, int len,
@@ -826,7 +803,7 @@ static noinline int replay_one_extent(struct btrfs_trans_handle *trans,
 					btrfs_file_extent_num_bytes(eb, item);
 			}
 
-			ret = btrfs_lookup_csums_range(root->log_root,
+			ret = btrfs_lookup_csums_list(root->log_root,
 						csum_start, csum_end - 1,
 						&ordered_sums, 0, false);
 			if (ret)
@@ -3686,15 +3663,29 @@ static int process_dir_items_leaf(struct btrfs_trans_handle *trans,
 				  u64 *last_old_dentry_offset)
 {
 	struct btrfs_root *log = inode->root->log_root;
-	struct extent_buffer *src = path->nodes[0];
-	const int nritems = btrfs_header_nritems(src);
+	struct extent_buffer *src;
+	const int nritems = btrfs_header_nritems(path->nodes[0]);
 	const u64 ino = btrfs_ino(inode);
 	bool last_found = false;
 	int batch_start = 0;
 	int batch_size = 0;
 	int i;
 
-	for (i = path->slots[0]; i < nritems; i++) {
+	/*
+	 * We need to clone the leaf, release the read lock on it, and use the
+	 * clone before modifying the log tree. See the comment at copy_items()
+	 * about why we need to do this.
+	 */
+	src = btrfs_clone_extent_buffer(path->nodes[0]);
+	if (!src)
+		return -ENOMEM;
+
+	i = path->slots[0];
+	btrfs_release_path(path);
+	path->nodes[0] = src;
+	path->slots[0] = i;
+
+	for (; i < nritems; i++) {
 		struct btrfs_dir_item *di;
 		struct btrfs_key key;
 		int ret;
@@ -4295,7 +4286,7 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
 {
 	struct btrfs_root *log = inode->root->log_root;
 	struct btrfs_file_extent_item *extent;
-	struct extent_buffer *src = src_path->nodes[0];
+	struct extent_buffer *src;
 	int ret = 0;
 	struct btrfs_key *ins_keys;
 	u32 *ins_sizes;
@@ -4305,6 +4296,43 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
 	int dst_index;
 	const bool skip_csum = (inode->flags & BTRFS_INODE_NODATASUM);
 	const u64 i_size = i_size_read(&inode->vfs_inode);
+
+	/*
+	 * To keep lockdep happy and avoid deadlocks, clone the source leaf and
+	 * use the clone. This is because otherwise we would be changing the log
+	 * tree, to insert items from the subvolume tree or insert csum items,
+	 * while holding a read lock on a leaf from the subvolume tree, which
+	 * creates a nasty lock dependency when COWing log tree nodes/leaves:
+	 *
+	 * 1) Modifying the log tree triggers an extent buffer allocation while
+	 *    holding a write lock on a parent extent buffer from the log tree.
+	 *    Allocating the pages for an extent buffer, or the extent buffer
+	 *    struct, can trigger inode eviction and finally the inode eviction
+	 *    will trigger a release/remove of a delayed node, which requires
+	 *    taking the delayed node's mutex;
+	 *
+	 * 2) Allocating a metadata extent for a log tree can trigger the async
+	 *    reclaim thread and make us wait for it to release enough space and
+	 *    unblock our reservation ticket. The reclaim thread can start
+	 *    flushing delayed items, and that in turn results in the need to
+	 *    lock delayed node mutexes and in the need to write lock extent
+	 *    buffers of a subvolume tree - all this while holding a write lock
+	 *    on the parent extent buffer in the log tree.
+	 *
+	 * So one task in scenario 1) running in parallel with another task in
+	 * scenario 2) could lead to a deadlock, one wanting to lock a delayed
+	 * node mutex while having a read lock on a leaf from the subvolume,
+	 * while the other is holding the delayed node's mutex and wants to
+	 * write lock the same subvolume leaf for flushing delayed items.
+	 */
+	src = btrfs_clone_extent_buffer(src_path->nodes[0]);
+	if (!src)
+		return -ENOMEM;
+
+	i = src_path->slots[0];
+	btrfs_release_path(src_path);
+	src_path->nodes[0] = src;
+	src_path->slots[0] = i;
 
 	ins_data = kmalloc(nr * sizeof(struct btrfs_key) +
 			   nr * sizeof(u32), GFP_NOFS);
@@ -4392,9 +4420,9 @@ static noinline int copy_items(struct btrfs_trans_handle *trans,
 
 		csum_root = btrfs_csum_root(trans->fs_info, disk_bytenr);
 		disk_bytenr += extent_offset;
-		ret = btrfs_lookup_csums_range(csum_root, disk_bytenr,
-					       disk_bytenr + extent_num_bytes - 1,
-					       &ordered_sums, 0, false);
+		ret = btrfs_lookup_csums_list(csum_root, disk_bytenr,
+					      disk_bytenr + extent_num_bytes - 1,
+					      &ordered_sums, 0, false);
 		if (ret)
 			goto out;
 
@@ -4587,10 +4615,9 @@ static int log_extent_csums(struct btrfs_trans_handle *trans,
 
 	/* block start is already adjusted for the file extent offset. */
 	csum_root = btrfs_csum_root(trans->fs_info, em->block_start);
-	ret = btrfs_lookup_csums_range(csum_root,
-				       em->block_start + csum_offset,
-				       em->block_start + csum_offset +
-				       csum_len - 1, &ordered_sums, 0, false);
+	ret = btrfs_lookup_csums_list(csum_root, em->block_start + csum_offset,
+				      em->block_start + csum_offset +
+				      csum_len - 1, &ordered_sums, 0, false);
 	if (ret)
 		return ret;
 
@@ -5355,7 +5382,7 @@ struct btrfs_dir_list {
  *    has a size that doesn't match the sum of the lengths of all the logged
  *    names - this is ok, not a problem, because at log replay time we set the
  *    directory's i_size to the correct value (see replay_one_name() and
- *    do_overwrite_item()).
+ *    overwrite_item()).
  */
 static int log_new_dir_dentries(struct btrfs_trans_handle *trans,
 				struct btrfs_inode *start_inode,
@@ -7432,8 +7459,11 @@ void btrfs_log_new_name(struct btrfs_trans_handle *trans,
 		 * not fail, but if it does, it's not serious, just bail out and
 		 * mark the log for a full commit.
 		 */
-		if (WARN_ON_ONCE(ret < 0))
+		if (WARN_ON_ONCE(ret < 0)) {
+			fscrypt_free_filename(&fname);
 			goto out;
+		}
+
 		log_pinned = true;
 
 		path = btrfs_alloc_path();

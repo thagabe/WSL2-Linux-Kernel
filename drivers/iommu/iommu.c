@@ -306,13 +306,23 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 	const struct iommu_ops *ops = dev->bus->iommu_ops;
 	struct iommu_device *iommu_dev;
 	struct iommu_group *group;
+	static DEFINE_MUTEX(iommu_probe_device_lock);
 	int ret;
 
 	if (!ops)
 		return -ENODEV;
-
-	if (!dev_iommu_get(dev))
-		return -ENOMEM;
+	/*
+	 * Serialise to avoid races between IOMMU drivers registering in
+	 * parallel and/or the "replay" calls from ACPI/OF code via client
+	 * driver probe. Once the latter have been cleaned up we should
+	 * probably be able to use device_lock() here to minimise the scope,
+	 * but for now enforcing a simple global ordering is fine.
+	 */
+	mutex_lock(&iommu_probe_device_lock);
+	if (!dev_iommu_get(dev)) {
+		ret = -ENOMEM;
+		goto err_unlock;
+	}
 
 	if (!try_module_get(ops->owner)) {
 		ret = -EINVAL;
@@ -333,11 +343,14 @@ static int __iommu_probe_device(struct device *dev, struct list_head *group_list
 		ret = PTR_ERR(group);
 		goto out_release;
 	}
-	iommu_group_put(group);
 
+	mutex_lock(&group->mutex);
 	if (group_list && !group->default_domain && list_empty(&group->entry))
 		list_add_tail(&group->entry, group_list);
+	mutex_unlock(&group->mutex);
+	iommu_group_put(group);
 
+	mutex_unlock(&iommu_probe_device_lock);
 	iommu_device_link(iommu_dev, dev);
 
 	return 0;
@@ -351,6 +364,9 @@ out_module_put:
 
 err_free:
 	dev_iommu_free(dev);
+
+err_unlock:
+	mutex_unlock(&iommu_probe_device_lock);
 
 	return ret;
 }
@@ -1824,10 +1840,10 @@ int bus_iommu_probe(struct bus_type *bus)
 		return ret;
 
 	list_for_each_entry_safe(group, next, &group_list, entry) {
+		mutex_lock(&group->mutex);
+
 		/* Remove item from the list */
 		list_del_init(&group->entry);
-
-		mutex_lock(&group->mutex);
 
 		/* Try to allocate default domain */
 		probe_alloc_default_domain(bus, group);
@@ -3112,9 +3128,6 @@ static int __iommu_take_dma_ownership(struct iommu_group *group, void *owner)
 {
 	int ret;
 
-	if (WARN_ON(!owner))
-		return -EINVAL;
-
 	if ((group->domain && group->domain != group->default_domain) ||
 	    !xa_empty(&group->pasid_array))
 		return -EBUSY;
@@ -3172,9 +3185,13 @@ EXPORT_SYMBOL_GPL(iommu_group_claim_dma_owner);
  */
 int iommu_device_claim_dma_owner(struct device *dev, void *owner)
 {
-	struct iommu_group *group = iommu_group_get(dev);
+	struct iommu_group *group;
 	int ret = 0;
 
+	if (WARN_ON(!owner))
+		return -EINVAL;
+
+	group = iommu_group_get(dev);
 	if (!group)
 		return -ENODEV;
 
@@ -3213,7 +3230,7 @@ static void __iommu_release_dma_ownership(struct iommu_group *group)
 
 /**
  * iommu_group_release_dma_owner() - Release DMA ownership of a group
- * @group: The group.
+ * @dev: The device
  *
  * Release the DMA ownership claimed by iommu_group_claim_dma_owner().
  */
@@ -3236,12 +3253,10 @@ void iommu_device_release_dma_owner(struct device *dev)
 	struct iommu_group *group = iommu_group_get(dev);
 
 	mutex_lock(&group->mutex);
-	if (group->owner_cnt > 1) {
+	if (group->owner_cnt > 1)
 		group->owner_cnt--;
-		goto unlock_out;
-	}
-	__iommu_release_dma_ownership(group);
-unlock_out:
+	else
+		__iommu_release_dma_ownership(group);
 	mutex_unlock(&group->mutex);
 	iommu_group_put(group);
 }

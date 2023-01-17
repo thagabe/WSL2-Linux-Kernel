@@ -61,13 +61,7 @@ config LLD_VERSION
 	default 0
 
 config RUST_IS_AVAILABLE
-	# Because some common tools like 'diff' don't support permissions of
-	# the files, 'rust_is_available.sh' in some trees that managed with such
-	# tools result in having no execution permission.  As a temporal work
-	# around, we specify the interpreter ('/bin/sh').  It will be unneeded
-	# once 'rust_is_available.sh' is merged in the mainline with its execution
-	# permission.
-	def_bool $(success,/bin/sh $(srctree)/scripts/rust_is_available.sh)
+	def_bool $(success,$(srctree)/scripts/rust_is_available.sh)
 	help
 	  This shows whether a suitable Rust toolchain is available (found).
 
@@ -93,7 +87,7 @@ config CC_HAS_ASM_GOTO_OUTPUT
 config CC_HAS_ASM_GOTO_TIED_OUTPUT
 	depends on CC_HAS_ASM_GOTO_OUTPUT
 	# Detect buggy gcc and clang, fixed in gcc-11 clang-14.
-	def_bool $(success,echo 'int foo(int *x) { asm goto (".long (%l[bar]) - .\n": "+m"(*x) ::: bar); return *x; bar: return 0; }' | $CC -x c - -c -o /dev/null)
+	def_bool $(success,echo 'int foo(int *x) { asm goto (".long (%l[bar]) - .": "+m"(*x) ::: bar); return *x; bar: return 0; }' | $CC -x c - -c -o /dev/null)
 
 config TOOLS_SUPPORT_RELR
 	def_bool $(success,env "CC=$(CC)" "LD=$(LD)" "NM=$(NM)" "OBJCOPY=$(OBJCOPY)" $(srctree)/scripts/tools-support-relr.sh)
@@ -900,13 +894,17 @@ config CC_IMPLICIT_FALLTHROUGH
 	default "-Wimplicit-fallthrough=5" if CC_IS_GCC && $(cc-option,-Wimplicit-fallthrough=5)
 	default "-Wimplicit-fallthrough" if CC_IS_CLANG && $(cc-option,-Wunreachable-code-fallthrough)
 
-# Currently, disable gcc-12 array-bounds globally.
+# Currently, disable gcc-11,12 array-bounds globally.
 # We may want to target only particular configurations some day.
+config GCC11_NO_ARRAY_BOUNDS
+	def_bool y
+
 config GCC12_NO_ARRAY_BOUNDS
 	def_bool y
 
 config CC_NO_ARRAY_BOUNDS
 	bool
+	default y if CC_IS_GCC && GCC_VERSION >= 110000 && GCC_VERSION < 120000 && GCC11_NO_ARRAY_BOUNDS
 	default y if CC_IS_GCC && GCC_VERSION >= 120000 && GCC_VERSION < 130000 && GCC12_NO_ARRAY_BOUNDS
 
 #

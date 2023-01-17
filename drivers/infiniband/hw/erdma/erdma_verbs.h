@@ -173,6 +173,10 @@ enum erdma_qp_attr_mask {
 	ERDMA_QP_ATTR_MPA = (1 << 7)
 };
 
+enum erdma_qp_flags {
+	ERDMA_QP_IN_FLUSHING = (1 << 0),
+};
+
 struct erdma_qp_attrs {
 	enum erdma_qp_state state;
 	enum erdma_cc_alg cc; /* Congestion control algorithm */
@@ -196,6 +200,9 @@ struct erdma_qp {
 	struct erdma_dev *dev;
 	struct erdma_cep *cep;
 	struct rw_semaphore state_lock;
+
+	unsigned long flags;
+	struct delayed_work reflush_dwork;
 
 	union {
 		struct erdma_kqp kern_qp;

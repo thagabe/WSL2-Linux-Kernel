@@ -2584,14 +2584,19 @@ union bpf_attr {
  * 		* **SOL_SOCKET**, which supports the following *optname*\ s:
  * 		  **SO_RCVBUF**, **SO_SNDBUF**, **SO_MAX_PACING_RATE**,
  * 		  **SO_PRIORITY**, **SO_RCVLOWAT**, **SO_MARK**,
- * 		  **SO_BINDTODEVICE**, **SO_KEEPALIVE**.
+ * 		  **SO_BINDTODEVICE**, **SO_KEEPALIVE**, **SO_REUSEADDR**,
+ * 		  **SO_REUSEPORT**, **SO_BINDTOIFINDEX**, **SO_TXREHASH**.
  * 		* **IPPROTO_TCP**, which supports the following *optname*\ s:
  * 		  **TCP_CONGESTION**, **TCP_BPF_IW**,
  * 		  **TCP_BPF_SNDCWND_CLAMP**, **TCP_SAVE_SYN**,
  * 		  **TCP_KEEPIDLE**, **TCP_KEEPINTVL**, **TCP_KEEPCNT**,
- *		  **TCP_SYNCNT**, **TCP_USER_TIMEOUT**, **TCP_NOTSENT_LOWAT**.
+ * 		  **TCP_SYNCNT**, **TCP_USER_TIMEOUT**, **TCP_NOTSENT_LOWAT**,
+ * 		  **TCP_NODELAY**, **TCP_MAXSEG**, **TCP_WINDOW_CLAMP**,
+ * 		  **TCP_THIN_LINEAR_TIMEOUTS**, **TCP_BPF_DELACK_MAX**,
+ * 		  **TCP_BPF_RTO_MIN**.
  * 		* **IPPROTO_IP**, which supports *optname* **IP_TOS**.
- * 		* **IPPROTO_IPV6**, which supports *optname* **IPV6_TCLASS**.
+ * 		* **IPPROTO_IPV6**, which supports the following *optname*\ s:
+ * 		  **IPV6_TCLASS**, **IPV6_AUTOFLOWLABEL**.
  * 	Return
  * 		0 on success, or a negative error in case of failure.
  *
@@ -2808,12 +2813,10 @@ union bpf_attr {
  * 		  and **BPF_CGROUP_INET6_CONNECT**.
  *
  * 		This helper actually implements a subset of **getsockopt()**.
- * 		It supports the following *level*\ s:
- *
- * 		* **IPPROTO_TCP**, which supports *optname*
- * 		  **TCP_CONGESTION**.
- * 		* **IPPROTO_IP**, which supports *optname* **IP_TOS**.
- * 		* **IPPROTO_IPV6**, which supports *optname* **IPV6_TCLASS**.
+ * 		It supports the same set of *optname*\ s that is supported by
+ * 		the **bpf_setsockopt**\ () helper.  The exceptions are
+ * 		**TCP_BPF_*** is **bpf_setsockopt**\ () only and
+ * 		**TCP_SAVED_SYN** is **bpf_getsockopt**\ () only.
  * 	Return
  * 		0 on success, or a negative error in case of failure.
  *
@@ -5290,7 +5293,7 @@ union bpf_attr {
  *	Return
  *		Nothing. Always succeeds.
  *
- * long bpf_dynptr_read(void *dst, u32 len, struct bpf_dynptr *src, u32 offset, u64 flags)
+ * long bpf_dynptr_read(void *dst, u32 len, const struct bpf_dynptr *src, u32 offset, u64 flags)
  *	Description
  *		Read *len* bytes from *src* into *dst*, starting from *offset*
  *		into *src*.
@@ -5300,7 +5303,7 @@ union bpf_attr {
  *		of *src*'s data, -EINVAL if *src* is an invalid dynptr or if
  *		*flags* is not 0.
  *
- * long bpf_dynptr_write(struct bpf_dynptr *dst, u32 offset, void *src, u32 len, u64 flags)
+ * long bpf_dynptr_write(const struct bpf_dynptr *dst, u32 offset, void *src, u32 len, u64 flags)
  *	Description
  *		Write *len* bytes from *src* into *dst*, starting from *offset*
  *		into *dst*.
@@ -5310,7 +5313,7 @@ union bpf_attr {
  *		of *dst*'s data, -EINVAL if *dst* is an invalid dynptr or if *dst*
  *		is a read-only dynptr or if *flags* is not 0.
  *
- * void *bpf_dynptr_data(struct bpf_dynptr *ptr, u32 offset, u32 len)
+ * void *bpf_dynptr_data(const struct bpf_dynptr *ptr, u32 offset, u32 len)
  *	Description
  *		Get a pointer to the underlying dynptr data.
  *
@@ -5411,7 +5414,7 @@ union bpf_attr {
  *		Drain samples from the specified user ring buffer, and invoke
  *		the provided callback for each such sample:
  *
- *		long (\*callback_fn)(struct bpf_dynptr \*dynptr, void \*ctx);
+ *		long (\*callback_fn)(const struct bpf_dynptr \*dynptr, void \*ctx);
  *
  *		If **callback_fn** returns 0, the helper will continue to try
  *		and drain the next sample, up to a maximum of

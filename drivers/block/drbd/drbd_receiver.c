@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-only
 /*
    drbd_receiver.c
 
@@ -413,7 +413,7 @@ void __drbd_free_peer_req(struct drbd_device *device, struct drbd_peer_request *
 	drbd_free_pages(device, peer_req->pages, is_net);
 	D_ASSERT(device, atomic_read(&peer_req->pending_bios) == 0);
 	D_ASSERT(device, drbd_interval_empty(&peer_req->i));
-	if (!expect(!(peer_req->flags & EE_CALL_AL_COMPLETE_IO))) {
+	if (!expect(device, !(peer_req->flags & EE_CALL_AL_COMPLETE_IO))) {
 		peer_req->flags &= ~EE_CALL_AL_COMPLETE_IO;
 		drbd_al_complete_io(device, &peer_req->i);
 	}
@@ -507,7 +507,7 @@ static int drbd_recv_short(struct socket *sock, void *buf, size_t size, int flag
 	struct msghdr msg = {
 		.msg_flags = (flags ? flags : MSG_WAITALL | MSG_NOSIGNAL)
 	};
-	iov_iter_kvec(&msg.msg_iter, READ, &iov, 1, size);
+	iov_iter_kvec(&msg.msg_iter, ITER_DEST, &iov, 1, size);
 	return sock_recvmsg(sock, &msg, msg.msg_flags);
 }
 
@@ -1029,6 +1029,9 @@ randomize:
 
 	sock.socket->sk->sk_allocation = GFP_NOIO;
 	msock.socket->sk->sk_allocation = GFP_NOIO;
+
+	sock.socket->sk->sk_use_task_frag = false;
+	msock.socket->sk->sk_use_task_frag = false;
 
 	sock.socket->sk->sk_priority = TC_PRIO_INTERACTIVE_BULK;
 	msock.socket->sk->sk_priority = TC_PRIO_INTERACTIVE;
@@ -1873,21 +1876,21 @@ read_in_block(struct drbd_peer_device *peer_device, u64 id, sector_t sector,
 	/* assume request_size == data_size, but special case trim. */
 	ds = data_size;
 	if (trim) {
-		if (!expect(data_size == 0))
+		if (!expect(peer_device, data_size == 0))
 			return NULL;
 		ds = be32_to_cpu(trim->size);
 	} else if (zeroes) {
-		if (!expect(data_size == 0))
+		if (!expect(peer_device, data_size == 0))
 			return NULL;
 		ds = be32_to_cpu(zeroes->size);
 	}
 
-	if (!expect(IS_ALIGNED(ds, 512)))
+	if (!expect(peer_device, IS_ALIGNED(ds, 512)))
 		return NULL;
 	if (trim || zeroes) {
-		if (!expect(ds <= (DRBD_MAX_BBIO_SECTORS << 9)))
+		if (!expect(peer_device, ds <= (DRBD_MAX_BBIO_SECTORS << 9)))
 			return NULL;
-	} else if (!expect(ds <= DRBD_MAX_BIO_SIZE))
+	} else if (!expect(peer_device, ds <= DRBD_MAX_BIO_SIZE))
 		return NULL;
 
 	/* even though we trust out peer,
@@ -2165,7 +2168,7 @@ static int receive_RSDataReply(struct drbd_connection *connection, struct packet
 		 * or in drbd_peer_request_endio. */
 		err = recv_resync_read(peer_device, sector, pi);
 	} else {
-		if (__ratelimit(&drbd_ratelimit_state))
+		if (drbd_ratelimit())
 			drbd_err(device, "Can not write resync data to local disk.\n");
 
 		err = drbd_drain_block(peer_device, pi->size);
@@ -2846,7 +2849,7 @@ static int receive_DataRequest(struct drbd_connection *connection, struct packet
 		default:
 			BUG();
 		}
-		if (verb && __ratelimit(&drbd_ratelimit_state))
+		if (verb && drbd_ratelimit())
 			drbd_err(device, "Can not satisfy peer's read request, "
 			    "no local data.\n");
 

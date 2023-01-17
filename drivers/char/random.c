@@ -53,8 +53,10 @@
 #include <linux/uaccess.h>
 #include <linux/suspend.h>
 #include <linux/siphash.h>
+#include <linux/sched/isolation.h>
 #include <crypto/chacha.h>
 #include <crypto/blake2s.h>
+#include <asm/archrandom.h>
 #include <asm/processor.h>
 #include <asm/irq.h>
 #include <asm/irq_regs.h>
@@ -84,6 +86,7 @@ static DEFINE_STATIC_KEY_FALSE(crng_is_ready);
 /* Various types of waiters for crng_init->CRNG_READY transition. */
 static DECLARE_WAIT_QUEUE_HEAD(crng_init_wait);
 static struct fasync_struct *fasync;
+static ATOMIC_NOTIFIER_HEAD(random_ready_notifier);
 
 /* Control how we warn userspace. */
 static struct ratelimit_state urandom_warning =
@@ -139,6 +142,26 @@ int wait_for_random_bytes(void)
 	return 0;
 }
 EXPORT_SYMBOL(wait_for_random_bytes);
+
+/*
+ * Add a callback function that will be invoked when the crng is initialised,
+ * or immediately if it already has been. Only use this is you are absolutely
+ * sure it is required. Most users should instead be able to test
+ * `rng_is_initialized()` on demand, or make use of `get_random_bytes_wait()`.
+ */
+int __cold execute_with_initialized_rng(struct notifier_block *nb)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&random_ready_notifier.lock, flags);
+	if (crng_ready())
+		nb->notifier_call(nb, 0, NULL);
+	else
+		ret = raw_notifier_chain_register((struct raw_notifier_head *)&random_ready_notifier.head, nb);
+	spin_unlock_irqrestore(&random_ready_notifier.lock, flags);
+	return ret;
+}
 
 #define warn_unseeded_randomness() \
 	if (IS_ENABLED(CONFIG_WARN_ALL_UNSEEDED_RANDOM) && !crng_ready()) \
@@ -697,6 +720,7 @@ static void __cold _credit_init_bits(size_t bits)
 		crng_reseed(NULL); /* Sets crng_init to CRNG_READY under base_crng.lock. */
 		if (static_key_initialized)
 			execute_in_process_context(crng_set_ready, &set_ready);
+		atomic_notifier_call_chain(&random_ready_notifier, 0, NULL);
 		wake_up_interruptible(&crng_init_wait);
 		kill_fasync(&fasync, SIGIO, POLL_IN);
 		pr_notice("crng init done\n");
@@ -1210,66 +1234,102 @@ void __cold rand_initialize_disk(struct gendisk *disk)
 struct entropy_timer_state {
 	unsigned long entropy;
 	struct timer_list timer;
-	unsigned int samples, samples_per_bit;
+	atomic_t samples;
+	unsigned int samples_per_bit;
 };
 
 /*
- * Each time the timer fires, we expect that we got an unpredictable
- * jump in the cycle counter. Even if the timer is running on another
- * CPU, the timer activity will be touching the stack of the CPU that is
- * generating entropy..
+ * Each time the timer fires, we expect that we got an unpredictable jump in
+ * the cycle counter. Even if the timer is running on another CPU, the timer
+ * activity will be touching the stack of the CPU that is generating entropy.
  *
- * Note that we don't re-arm the timer in the timer itself - we are
- * happy to be scheduled away, since that just makes the load more
- * complex, but we do not want the timer to keep ticking unless the
- * entropy loop is running.
+ * Note that we don't re-arm the timer in the timer itself - we are happy to be
+ * scheduled away, since that just makes the load more complex, but we do not
+ * want the timer to keep ticking unless the entropy loop is running.
  *
  * So the re-arming always happens in the entropy loop itself.
  */
 static void __cold entropy_timer(struct timer_list *timer)
 {
 	struct entropy_timer_state *state = container_of(timer, struct entropy_timer_state, timer);
+	unsigned long entropy = random_get_entropy();
 
-	if (++state->samples == state->samples_per_bit) {
+	mix_pool_bytes(&entropy, sizeof(entropy));
+	if (atomic_inc_return(&state->samples) % state->samples_per_bit == 0)
 		credit_init_bits(1);
-		state->samples = 0;
-	}
 }
 
 /*
- * If we have an actual cycle counter, see if we can
- * generate enough entropy with timing noise
+ * If we have an actual cycle counter, see if we can generate enough entropy
+ * with timing noise.
  */
 static void __cold try_to_generate_entropy(void)
 {
 	enum { NUM_TRIAL_SAMPLES = 8192, MAX_SAMPLES_PER_BIT = HZ / 15 };
-	struct entropy_timer_state stack;
+	u8 stack_bytes[sizeof(struct entropy_timer_state) + SMP_CACHE_BYTES - 1];
+	struct entropy_timer_state *stack = PTR_ALIGN((void *)stack_bytes, SMP_CACHE_BYTES);
 	unsigned int i, num_different = 0;
 	unsigned long last = random_get_entropy();
+	int cpu = -1;
 
 	for (i = 0; i < NUM_TRIAL_SAMPLES - 1; ++i) {
-		stack.entropy = random_get_entropy();
-		if (stack.entropy != last)
+		stack->entropy = random_get_entropy();
+		if (stack->entropy != last)
 			++num_different;
-		last = stack.entropy;
+		last = stack->entropy;
 	}
-	stack.samples_per_bit = DIV_ROUND_UP(NUM_TRIAL_SAMPLES, num_different + 1);
-	if (stack.samples_per_bit > MAX_SAMPLES_PER_BIT)
+	stack->samples_per_bit = DIV_ROUND_UP(NUM_TRIAL_SAMPLES, num_different + 1);
+	if (stack->samples_per_bit > MAX_SAMPLES_PER_BIT)
 		return;
 
-	stack.samples = 0;
-	timer_setup_on_stack(&stack.timer, entropy_timer, 0);
+	atomic_set(&stack->samples, 0);
+	timer_setup_on_stack(&stack->timer, entropy_timer, 0);
 	while (!crng_ready() && !signal_pending(current)) {
-		if (!timer_pending(&stack.timer))
-			mod_timer(&stack.timer, jiffies);
-		mix_pool_bytes(&stack.entropy, sizeof(stack.entropy));
-		schedule();
-		stack.entropy = random_get_entropy();
-	}
+		/*
+		 * Check !timer_pending() and then ensure that any previous callback has finished
+		 * executing by checking try_to_del_timer_sync(), before queueing the next one.
+		 */
+		if (!timer_pending(&stack->timer) && try_to_del_timer_sync(&stack->timer) >= 0) {
+			struct cpumask timer_cpus;
+			unsigned int num_cpus;
 
-	del_timer_sync(&stack.timer);
-	destroy_timer_on_stack(&stack.timer);
-	mix_pool_bytes(&stack.entropy, sizeof(stack.entropy));
+			/*
+			 * Preemption must be disabled here, both to read the current CPU number
+			 * and to avoid scheduling a timer on a dead CPU.
+			 */
+			preempt_disable();
+
+			/* Only schedule callbacks on timer CPUs that are online. */
+			cpumask_and(&timer_cpus, housekeeping_cpumask(HK_TYPE_TIMER), cpu_online_mask);
+			num_cpus = cpumask_weight(&timer_cpus);
+			/* In very bizarre case of misconfiguration, fallback to all online. */
+			if (unlikely(num_cpus == 0)) {
+				timer_cpus = *cpu_online_mask;
+				num_cpus = cpumask_weight(&timer_cpus);
+			}
+
+			/* Basic CPU round-robin, which avoids the current CPU. */
+			do {
+				cpu = cpumask_next(cpu, &timer_cpus);
+				if (cpu == nr_cpumask_bits)
+					cpu = cpumask_first(&timer_cpus);
+			} while (cpu == smp_processor_id() && num_cpus > 1);
+
+			/* Expiring the timer at `jiffies` means it's the next tick. */
+			stack->timer.expires = jiffies;
+
+			add_timer_on(&stack->timer, cpu);
+
+			preempt_enable();
+		}
+		mix_pool_bytes(&stack->entropy, sizeof(stack->entropy));
+		schedule();
+		stack->entropy = random_get_entropy();
+	}
+	mix_pool_bytes(&stack->entropy, sizeof(stack->entropy));
+
+	del_timer_sync(&stack->timer);
+	destroy_timer_on_stack(&stack->timer);
 }
 
 
@@ -1325,7 +1385,7 @@ SYSCALL_DEFINE3(getrandom, char __user *, ubuf, size_t, len, unsigned int, flags
 			return ret;
 	}
 
-	ret = import_single_range(READ, ubuf, len, &iov, &iter);
+	ret = import_single_range(ITER_DEST, ubuf, len, &iov, &iter);
 	if (unlikely(ret))
 		return ret;
 	return get_random_bytes_user(&iter);
@@ -1443,7 +1503,7 @@ static long random_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			return -EINVAL;
 		if (get_user(len, p++))
 			return -EFAULT;
-		ret = import_single_range(WRITE, p, len, &iov, &iter);
+		ret = import_single_range(ITER_SOURCE, p, len, &iov, &iter);
 		if (unlikely(ret))
 			return ret;
 		ret = write_pool_user(&iter);

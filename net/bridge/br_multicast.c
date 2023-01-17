@@ -552,7 +552,8 @@ static void br_multicast_fwd_src_remove(struct net_bridge_group_src *src,
 			continue;
 
 		if (p->rt_protocol != RTPROT_KERNEL &&
-		    (p->flags & MDB_PG_FLAGS_PERMANENT))
+		    (p->flags & MDB_PG_FLAGS_PERMANENT) &&
+		    !(src->flags & BR_SGRP_F_USER_ADDED))
 			break;
 
 		if (fastleave)
@@ -605,7 +606,7 @@ static void br_multicast_destroy_mdb_entry(struct net_bridge_mcast_gc *gc)
 	WARN_ON(!hlist_unhashed(&mp->mdb_node));
 	WARN_ON(mp->ports);
 
-	del_timer_sync(&mp->timer);
+	timer_shutdown_sync(&mp->timer);
 	kfree_rcu(mp, rcu);
 }
 
@@ -646,20 +647,25 @@ static void br_multicast_destroy_group_src(struct net_bridge_mcast_gc *gc)
 	src = container_of(gc, struct net_bridge_group_src, mcast_gc);
 	WARN_ON(!hlist_unhashed(&src->node));
 
-	del_timer_sync(&src->timer);
+	timer_shutdown_sync(&src->timer);
 	kfree_rcu(src, rcu);
+}
+
+void __br_multicast_del_group_src(struct net_bridge_group_src *src)
+{
+	struct net_bridge *br = src->pg->key.port->br;
+
+	hlist_del_init_rcu(&src->node);
+	src->pg->src_ents--;
+	hlist_add_head(&src->mcast_gc.gc_node, &br->mcast_gc_list);
+	queue_work(system_long_wq, &br->mcast_gc_work);
 }
 
 void br_multicast_del_group_src(struct net_bridge_group_src *src,
 				bool fastleave)
 {
-	struct net_bridge *br = src->pg->key.port->br;
-
 	br_multicast_fwd_src_remove(src, fastleave);
-	hlist_del_init_rcu(&src->node);
-	src->pg->src_ents--;
-	hlist_add_head(&src->mcast_gc.gc_node, &br->mcast_gc_list);
-	queue_work(system_long_wq, &br->mcast_gc_work);
+	__br_multicast_del_group_src(src);
 }
 
 static void br_multicast_destroy_port_group(struct net_bridge_mcast_gc *gc)
@@ -670,8 +676,8 @@ static void br_multicast_destroy_port_group(struct net_bridge_mcast_gc *gc)
 	WARN_ON(!hlist_unhashed(&pg->mglist));
 	WARN_ON(!hlist_empty(&pg->src_list));
 
-	del_timer_sync(&pg->rexmit_timer);
-	del_timer_sync(&pg->timer);
+	timer_shutdown_sync(&pg->rexmit_timer);
+	timer_shutdown_sync(&pg->timer);
 	kfree_rcu(pg, rcu);
 }
 
@@ -1232,7 +1238,7 @@ br_multicast_find_group_src(struct net_bridge_port_group *pg, struct br_ip *ip)
 	return NULL;
 }
 
-static struct net_bridge_group_src *
+struct net_bridge_group_src *
 br_multicast_new_group_src(struct net_bridge_port_group *pg, struct br_ip *src_ip)
 {
 	struct net_bridge_group_src *grp_src;
@@ -1273,7 +1279,7 @@ br_multicast_new_group_src(struct net_bridge_port_group *pg, struct br_ip *src_i
 
 struct net_bridge_port_group *br_multicast_new_port_group(
 			struct net_bridge_port *port,
-			struct br_ip *group,
+			const struct br_ip *group,
 			struct net_bridge_port_group __rcu *next,
 			unsigned char flags,
 			const unsigned char *src,

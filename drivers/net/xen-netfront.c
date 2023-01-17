@@ -1862,6 +1862,12 @@ static int netfront_resume(struct xenbus_device *dev)
 	netif_tx_unlock_bh(info->netdev);
 
 	xennet_disconnect_backend(info);
+
+	rtnl_lock();
+	if (info->queues)
+		xennet_destroy_queues(info);
+	rtnl_unlock();
+
 	return 0;
 }
 
@@ -2640,7 +2646,7 @@ static void xennet_bus_close(struct xenbus_device *dev)
 	} while (!ret);
 }
 
-static int xennet_remove(struct xenbus_device *dev)
+static void xennet_remove(struct xenbus_device *dev)
 {
 	struct netfront_info *info = dev_get_drvdata(&dev->dev);
 
@@ -2656,8 +2662,6 @@ static int xennet_remove(struct xenbus_device *dev)
 		rtnl_unlock();
 	}
 	xennet_free_netdev(info->netdev);
-
-	return 0;
 }
 
 static const struct xenbus_device_id netfront_ids[] = {

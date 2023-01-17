@@ -455,7 +455,7 @@ config MV_XOR_V2
 	select DMA_ENGINE
 	select DMA_ENGINE_RAID
 	select ASYNC_TX_ENABLE_CHANNEL_SWITCH
-	select GENERIC_MSI_IRQ_DOMAIN
+	select GENERIC_MSI_IRQ
 	help
 	  Enable support for the Marvell version 2 XOR engine.
 
@@ -609,6 +609,18 @@ config SPRD_DMA
 	select DMA_VIRTUAL_CHANNELS
 	help
 	  Enable support for the on-chip DMA controller on Spreadtrum platform.
+
+config S3C24XX_DMAC
+	bool "Samsung S3C24XX DMA support"
+	depends on ARCH_S3C24XX || COMPILE_TEST
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Support for the Samsung S3C24XX DMA controller driver. The
+	  DMA controller is having multiple DMA channels which can be
+	  configured for different peripherals like audio, UART, SPI.
+	  The DMA controller can transfer data from memory to peripheral,
+	  periphal to memory, periphal to periphal and memory to memory.
 
 config TXX9_DMAC
 	tristate "Toshiba TXx9 SoC DMA support"

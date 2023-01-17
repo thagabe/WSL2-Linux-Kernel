@@ -474,6 +474,9 @@ static u8 pcal6534_recalc_addr(struct pca953x_chip *chip, int reg, int off)
 	case PCAL6524_DEBOUNCE:
 		pinctrl = ((reg & PCAL_PINCTRL_MASK) >> 1) + 0x1c;
 		break;
+	default:
+		pinctrl = 0;
+		break;
 	}
 
 	return pinctrl + addr + (off / BANK_SZ);
@@ -1050,9 +1053,9 @@ out:
 	return ret;
 }
 
-static int pca953x_probe(struct i2c_client *client,
-			 const struct i2c_device_id *i2c_id)
+static int pca953x_probe(struct i2c_client *client)
 {
+	const struct i2c_device_id *i2c_id = i2c_client_get_device_id(client);
 	struct pca953x_platform_data *pdata;
 	struct pca953x_chip *chip;
 	int irq_base = 0;
@@ -1376,7 +1379,7 @@ static struct i2c_driver pca953x_driver = {
 		.of_match_table = pca953x_dt_ids,
 		.acpi_match_table = pca953x_acpi_ids,
 	},
-	.probe		= pca953x_probe,
+	.probe_new	= pca953x_probe,
 	.remove		= pca953x_remove,
 	.id_table	= pca953x_id,
 };

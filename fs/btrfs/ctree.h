@@ -335,6 +335,23 @@ struct btrfs_root {
 #endif
 };
 
+static inline bool btrfs_root_readonly(const struct btrfs_root *root)
+{
+	/* Byte-swap the constant at compile time, root_item::flags is LE */
+	return (root->root_item.flags & cpu_to_le64(BTRFS_ROOT_SUBVOL_RDONLY)) != 0;
+}
+
+static inline bool btrfs_root_dead(const struct btrfs_root *root)
+{
+	/* Byte-swap the constant at compile time, root_item::flags is LE */
+	return (root->root_item.flags & cpu_to_le64(BTRFS_ROOT_SUBVOL_DEAD)) != 0;
+}
+
+static inline u64 btrfs_root_id(const struct btrfs_root *root)
+{
+	return root->root_key.objectid;
+}
+
 /*
  * Structure that conveys information about an extent that is going to replace
  * all the extents in a file range.
@@ -442,14 +459,6 @@ static inline u32 BTRFS_MAX_ITEM_SIZE(const struct btrfs_fs_info *info)
 static inline u32 BTRFS_NODEPTRS_PER_BLOCK(const struct btrfs_fs_info *info)
 {
 	return BTRFS_LEAF_DATA_SIZE(info) / sizeof(struct btrfs_key_ptr);
-}
-
-#define BTRFS_FILE_EXTENT_INLINE_DATA_START		\
-		(offsetof(struct btrfs_file_extent_item, disk_bytenr))
-static inline u32 BTRFS_MAX_INLINE_DATA_SIZE(const struct btrfs_fs_info *info)
-{
-	return BTRFS_MAX_ITEM_SIZE(info) -
-	       BTRFS_FILE_EXTENT_INLINE_DATA_START;
 }
 
 static inline u32 BTRFS_MAX_XATTR_SIZE(const struct btrfs_fs_info *info)
@@ -677,39 +686,6 @@ static inline int btrfs_next_item(struct btrfs_root *root, struct btrfs_path *p)
 }
 int btrfs_leaf_free_space(struct extent_buffer *leaf);
 
-/*
- * Get the correct offset inside the page of extent buffer.
- *
- * @eb:		target extent buffer
- * @start:	offset inside the extent buffer
- *
- * Will handle both sectorsize == PAGE_SIZE and sectorsize < PAGE_SIZE cases.
- */
-static inline size_t get_eb_offset_in_page(const struct extent_buffer *eb,
-					   unsigned long offset)
-{
-	/*
-	 * For sectorsize == PAGE_SIZE case, eb->start will always be aligned
-	 * to PAGE_SIZE, thus adding it won't cause any difference.
-	 *
-	 * For sectorsize < PAGE_SIZE, we must only read the data that belongs
-	 * to the eb, thus we have to take the eb->start into consideration.
-	 */
-	return offset_in_page(offset + eb->start);
-}
-
-static inline unsigned long get_eb_page_index(unsigned long offset)
-{
-	/*
-	 * For sectorsize == PAGE_SIZE case, plain >> PAGE_SHIFT is enough.
-	 *
-	 * For sectorsize < PAGE_SIZE case, we only support 64K PAGE_SIZE,
-	 * and have ensured that all tree blocks are contained in one page,
-	 * thus we always get index == 0.
-	 */
-	return offset >> PAGE_SHIFT;
-}
-
 static inline int is_fstree(u64 rootid)
 {
 	if (rootid == BTRFS_FS_TREE_OBJECTID ||
@@ -723,6 +699,11 @@ static inline bool btrfs_is_data_reloc_root(const struct btrfs_root *root)
 {
 	return root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID;
 }
+
+int btrfs_super_csum_size(const struct btrfs_super_block *s);
+const char *btrfs_super_csum_name(u16 csum_type);
+const char *btrfs_super_csum_driver(u16 csum_type);
+size_t __attribute_const__ btrfs_get_num_csums(void);
 
 /*
  * We use page status Private2 to indicate there is an ordered extent with

@@ -8,7 +8,7 @@
 
 / {
 	model = "Sony Xperia Z2 Tablet";
-	compatible = "sony,xperia-castor", "qcom,msm8974";
+	compatible = "sony,xperia-castor", "qcom,msm8974pro", "qcom,msm8974";
 	chassis-type = "tablet";
 
 	aliases {
@@ -210,31 +210,6 @@
 		host-wakeup-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&tlmm 96 GPIO_ACTIVE_HIGH>;
 		shutdown-gpios = <&pm8941_gpios 16 GPIO_ACTIVE_HIGH>;
-	};
-};
-
-&otg {
-	status = "okay";
-
-	phys = <&usb_hs1_phy>;
-	phy-select = <&tcsr 0xb000 0>;
-	extcon = <&smbb>, <&usb_id>;
-	vbus-supply = <&chg_otg>;
-
-	hnp-disable;
-	srp-disable;
-	adp-disable;
-
-	ulpi {
-		phy@a {
-			status = "okay";
-
-			v1p8-supply = <&pm8941_l6>;
-			v3p3-supply = <&pm8941_l24>;
-
-			extcon = <&smbb>;
-			qcom,init-seq = /bits/ 8 <0x1 0x64>;
-		};
 	};
 };
 
@@ -637,4 +612,27 @@
 		drive-strength = <2>;
 		bias-disable;
 	};
+};
+
+&usb {
+	status = "okay";
+
+	phys = <&usb_hs1_phy>;
+	phy-select = <&tcsr 0xb000 0>;
+	extcon = <&smbb>, <&usb_id>;
+	vbus-supply = <&chg_otg>;
+
+	hnp-disable;
+	srp-disable;
+	adp-disable;
+};
+
+&usb_hs1_phy {
+	status = "okay";
+
+	v1p8-supply = <&pm8941_l6>;
+	v3p3-supply = <&pm8941_l24>;
+
+	extcon = <&smbb>;
+	qcom,init-seq = /bits/ 8 <0x1 0x64>;
 };

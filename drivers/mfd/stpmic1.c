@@ -108,16 +108,16 @@ static const struct regmap_irq stpmic1_irqs[] = {
 static const struct regmap_irq_chip stpmic1_regmap_irq_chip = {
 	.name = "pmic_irq",
 	.status_base = INT_PENDING_R1,
-	.mask_base = INT_CLEAR_MASK_R1,
-	.unmask_base = INT_SET_MASK_R1,
+	.mask_base = INT_SET_MASK_R1,
+	.unmask_base = INT_CLEAR_MASK_R1,
+	.mask_unmask_non_inverted = true,
 	.ack_base = INT_CLEAR_R1,
 	.num_regs = STPMIC1_PMIC_NUM_IRQ_REGS,
 	.irqs = stpmic1_irqs,
 	.num_irqs = ARRAY_SIZE(stpmic1_irqs),
 };
 
-static int stpmic1_probe(struct i2c_client *i2c,
-			 const struct i2c_device_id *id)
+static int stpmic1_probe(struct i2c_client *i2c)
 {
 	struct stpmic1 *ddata;
 	struct device *dev = &i2c->dev;
@@ -201,7 +201,7 @@ static struct i2c_driver stpmic1_driver = {
 		.of_match_table = of_match_ptr(stpmic1_of_match),
 		.pm = pm_sleep_ptr(&stpmic1_pm),
 	},
-	.probe = stpmic1_probe,
+	.probe_new = stpmic1_probe,
 };
 
 module_i2c_driver(stpmic1_driver);

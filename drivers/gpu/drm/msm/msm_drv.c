@@ -418,7 +418,6 @@ static int msm_drm_init(struct device *dev, const struct drm_driver *drv)
 	priv->dev = ddev;
 
 	priv->wq = alloc_ordered_workqueue("msm", 0);
-	priv->hangcheck_period = DRM_MSM_HANGCHECK_DEFAULT_PERIOD;
 
 	INIT_LIST_HEAD(&priv->objects);
 	mutex_init(&priv->obj_lock);
@@ -1279,7 +1278,7 @@ void msm_drv_shutdown(struct platform_device *pdev)
 	 * msm_drm_init, drm_dev->registered is used as an indicator that the
 	 * shutdown will be successful.
 	 */
-	if (drm && drm->registered)
+	if (drm && drm->registered && priv->kms)
 		drm_atomic_helper_shutdown(drm);
 }
 

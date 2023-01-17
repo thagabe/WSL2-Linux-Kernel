@@ -639,24 +639,18 @@ static void reset_pmselr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 
 static void reset_pmcr(struct kvm_vcpu *vcpu, const struct sys_reg_desc *r)
 {
-	u64 pmcr, val;
+	u64 pmcr;
 
 	/* No PMU available, PMCR_EL0 may UNDEF... */
 	if (!kvm_arm_support_pmu_v3())
 		return;
 
-	pmcr = read_sysreg(pmcr_el0);
-	/*
-	 * Writable bits of PMCR_EL0 (ARMV8_PMU_PMCR_MASK) are reset to UNKNOWN
-	 * except PMCR.E resetting to zero.
-	 */
-	val = ((pmcr & ~ARMV8_PMU_PMCR_MASK)
-	       | (ARMV8_PMU_PMCR_MASK & 0xdecafbad)) & (~ARMV8_PMU_PMCR_E);
+	/* Only preserve PMCR_EL0.N, and reset the rest to 0 */
+	pmcr = read_sysreg(pmcr_el0) & (ARMV8_PMU_PMCR_N_MASK << ARMV8_PMU_PMCR_N_SHIFT);
 	if (!kvm_supports_32bit_el0())
-		val |= ARMV8_PMU_PMCR_LC;
-	if (!kvm_pmu_is_3p5(vcpu))
-		val &= ~ARMV8_PMU_PMCR_LP;
-	__vcpu_sys_reg(vcpu, r->reg) = val;
+		pmcr |= ARMV8_PMU_PMCR_LC;
+
+	__vcpu_sys_reg(vcpu, r->reg) = pmcr;
 }
 
 static bool check_pmu_access_disabled(struct kvm_vcpu *vcpu, u64 flags)
@@ -699,15 +693,15 @@ static bool access_pmcr(struct kvm_vcpu *vcpu, struct sys_reg_params *p,
 		return false;
 
 	if (p->is_write) {
-		/* Only update writeable bits of PMCR */
+		/*
+		 * Only update writeable bits of PMCR (continuing into
+		 * kvm_pmu_handle_pmcr() as well)
+		 */
 		val = __vcpu_sys_reg(vcpu, PMCR_EL0);
 		val &= ~ARMV8_PMU_PMCR_MASK;
 		val |= p->regval & ARMV8_PMU_PMCR_MASK;
 		if (!kvm_supports_32bit_el0())
 			val |= ARMV8_PMU_PMCR_LC;
-		if (!kvm_pmu_is_3p5(vcpu))
-			val &= ~ARMV8_PMU_PMCR_LP;
-		__vcpu_sys_reg(vcpu, PMCR_EL0) = val;
 		kvm_pmu_handle_pmcr(vcpu, val);
 		kvm_vcpu_pmu_restore_guest(vcpu);
 	} else {
@@ -1077,12 +1071,12 @@ static u8 vcpu_pmuver(const struct kvm_vcpu *vcpu)
 static u8 perfmon_to_pmuver(u8 perfmon)
 {
 	switch (perfmon) {
-	case ID_DFR0_PERFMON_8_0:
+	case ID_DFR0_EL1_PerfMon_PMUv3:
 		return ID_AA64DFR0_EL1_PMUVer_IMP;
-	case ID_DFR0_PERFMON_IMP_DEF:
+	case ID_DFR0_EL1_PerfMon_IMPDEF:
 		return ID_AA64DFR0_EL1_PMUVer_IMP_DEF;
 	default:
-		/* Anything ARMv8.1+ has the same value. For now. */
+		/* Anything ARMv8.1+ and NI have the same value. For now. */
 		return perfmon;
 	}
 }
@@ -1091,11 +1085,11 @@ static u8 pmuver_to_perfmon(u8 pmuver)
 {
 	switch (pmuver) {
 	case ID_AA64DFR0_EL1_PMUVer_IMP:
-		return ID_DFR0_PERFMON_8_0;
+		return ID_DFR0_EL1_PerfMon_PMUv3;
 	case ID_AA64DFR0_EL1_PMUVer_IMP_DEF:
-		return ID_DFR0_PERFMON_IMP_DEF;
+		return ID_DFR0_EL1_PerfMon_IMPDEF;
 	default:
-		/* Anything ARMv8.1+ has the same value. For now. */
+		/* Anything ARMv8.1+ and NI have the same value. For now. */
 		return pmuver;
 	}
 }
@@ -1157,8 +1151,8 @@ static u64 read_id_reg(const struct kvm_vcpu *vcpu, struct sys_reg_desc const *r
 		val &= ~ARM64_FEATURE_MASK(ID_AA64DFR0_EL1_PMSVer);
 		break;
 	case SYS_ID_DFR0_EL1:
-		val &= ~ARM64_FEATURE_MASK(ID_DFR0_PERFMON);
-		val |= FIELD_PREP(ARM64_FEATURE_MASK(ID_DFR0_PERFMON),
+		val &= ~ARM64_FEATURE_MASK(ID_DFR0_EL1_PerfMon);
+		val |= FIELD_PREP(ARM64_FEATURE_MASK(ID_DFR0_EL1_PerfMon),
 				  pmuver_to_perfmon(vcpu_pmuver(vcpu)));
 		break;
 	}
@@ -1313,12 +1307,12 @@ static int set_id_dfr0_el1(struct kvm_vcpu *vcpu,
 	 * AArch64 side (as everything is emulated with that), and
 	 * that this is a PMUv3.
 	 */
-	perfmon = FIELD_GET(ARM64_FEATURE_MASK(ID_DFR0_PERFMON), val);
-	if ((perfmon != ID_DFR0_PERFMON_IMP_DEF && perfmon > host_perfmon) ||
-	    (perfmon != 0 && perfmon < ID_DFR0_PERFMON_8_0))
+	perfmon = FIELD_GET(ARM64_FEATURE_MASK(ID_DFR0_EL1_PerfMon), val);
+	if ((perfmon != ID_DFR0_EL1_PerfMon_IMPDEF && perfmon > host_perfmon) ||
+	    (perfmon != 0 && perfmon < ID_DFR0_EL1_PerfMon_PMUv3))
 		return -EINVAL;
 
-	valid_pmu = (perfmon != 0 && perfmon != ID_DFR0_PERFMON_IMP_DEF);
+	valid_pmu = (perfmon != 0 && perfmon != ID_DFR0_EL1_PerfMon_IMPDEF);
 
 	/* Make sure view register and PMU support do match */
 	if (kvm_vcpu_has_pmu(vcpu) != valid_pmu)
@@ -1326,7 +1320,7 @@ static int set_id_dfr0_el1(struct kvm_vcpu *vcpu,
 
 	/* We can only differ with PerfMon, and anything else is an error */
 	val ^= read_id_reg(vcpu, rd);
-	val &= ~ARM64_FEATURE_MASK(ID_DFR0_PERFMON);
+	val &= ~ARM64_FEATURE_MASK(ID_DFR0_EL1_PerfMon);
 	if (val)
 		return -EINVAL;
 

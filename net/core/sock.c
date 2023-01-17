@@ -901,13 +901,20 @@ int sock_set_timestamping(struct sock *sk, int optname,
 	if (val & ~SOF_TIMESTAMPING_MASK)
 		return -EINVAL;
 
+	if (val & SOF_TIMESTAMPING_OPT_ID_TCP &&
+	    !(val & SOF_TIMESTAMPING_OPT_ID))
+		return -EINVAL;
+
 	if (val & SOF_TIMESTAMPING_OPT_ID &&
 	    !(sk->sk_tsflags & SOF_TIMESTAMPING_OPT_ID)) {
 		if (sk_is_tcp(sk)) {
 			if ((1 << sk->sk_state) &
 			    (TCPF_CLOSE | TCPF_LISTEN))
 				return -EINVAL;
-			atomic_set(&sk->sk_tskey, tcp_sk(sk)->snd_una);
+			if (val & SOF_TIMESTAMPING_OPT_ID_TCP)
+				atomic_set(&sk->sk_tskey, tcp_sk(sk)->write_seq);
+			else
+				atomic_set(&sk->sk_tskey, tcp_sk(sk)->snd_una);
 		} else {
 			atomic_set(&sk->sk_tskey, 0);
 		}
@@ -3383,6 +3390,7 @@ void sock_init_data(struct socket *sock, struct sock *sk)
 	sk->sk_rcvbuf		=	READ_ONCE(sysctl_rmem_default);
 	sk->sk_sndbuf		=	READ_ONCE(sysctl_wmem_default);
 	sk->sk_state		=	TCP_CLOSE;
+	sk->sk_use_task_frag	=	true;
 	sk_set_socket(sk, sock);
 
 	sock_set_flag(sk, SOCK_ZAPPED);

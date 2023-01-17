@@ -1471,9 +1471,7 @@ static int fimc_md_probe(struct platform_device *pdev)
 
 	pinctrl = devm_pinctrl_get(dev);
 	if (IS_ERR(pinctrl)) {
-		ret = PTR_ERR(pinctrl);
-		if (ret != -EPROBE_DEFER)
-			dev_err(dev, "Failed to get pinctrl: %d\n", ret);
+		ret = dev_err_probe(dev, PTR_ERR(pinctrl), "Failed to get pinctrl\n");
 		goto err_clk;
 	}
 
@@ -1584,7 +1582,11 @@ static int __init fimc_md_init(void)
 	if (ret)
 		return ret;
 
-	return platform_driver_register(&fimc_md_driver);
+	ret = platform_driver_register(&fimc_md_driver);
+	if (ret)
+		fimc_unregister_driver();
+
+	return ret;
 }
 
 static void __exit fimc_md_exit(void)

@@ -1218,8 +1218,7 @@ int hid_open_report(struct hid_device *device)
 		return -ENODEV;
 	size = device->dev_rsize;
 
-	/* call_hid_bpf_rdesc_fixup() ensures we work on a copy of rdesc */
-	buf = call_hid_bpf_rdesc_fixup(device, start, &size);
+	buf = kmemdup(start, size, GFP_KERNEL);
 	if (buf == NULL)
 		return -ENOMEM;
 
@@ -1315,6 +1314,9 @@ static s32 snto32(__u32 value, unsigned n)
 {
 	if (!value || !n)
 		return 0;
+
+	if (n > 32)
+		n = 32;
 
 	switch (n) {
 	case 8:  return ((__s8)value);
@@ -2041,12 +2043,6 @@ int hid_input_report(struct hid_device *hid, enum hid_report_type type, u8 *data
 	report_enum = hid->report_enum + type;
 	hdrv = hid->driver;
 
-	data = dispatch_hid_bpf_device_event(hid, type, data, &size, interrupt);
-	if (IS_ERR(data)) {
-		ret = PTR_ERR(data);
-		goto unlock;
-	}
-
 	if (!size) {
 		dbg_hid("empty report\n");
 		ret = -1;
@@ -2161,10 +2157,6 @@ int hid_connect(struct hid_device *hdev, unsigned int connect_mask)
 	int len;
 	int ret;
 
-	ret = hid_bpf_connect_device(hdev);
-	if (ret)
-		return ret;
-
 	if (hdev->quirks & HID_QUIRK_HIDDEV_FORCE)
 		connect_mask |= (HID_CONNECT_HIDDEV_FORCE | HID_CONNECT_HIDDEV);
 	if (hdev->quirks & HID_QUIRK_HIDINPUT_FORCE)
@@ -2266,8 +2258,6 @@ void hid_disconnect(struct hid_device *hdev)
 	if (hdev->claimed & HID_CLAIMED_HIDRAW)
 		hidraw_disconnect(hdev);
 	hdev->claimed = 0;
-
-	hid_bpf_disconnect_device(hdev);
 }
 EXPORT_SYMBOL_GPL(hid_disconnect);
 
@@ -2803,8 +2793,6 @@ struct hid_device *hid_allocate_device(void)
 	sema_init(&hdev->driver_input_lock, 1);
 	mutex_init(&hdev->ll_open_lock);
 
-	hid_bpf_device_init(hdev);
-
 	return hdev;
 }
 EXPORT_SYMBOL_GPL(hid_allocate_device);
@@ -2831,7 +2819,6 @@ static void hid_remove_device(struct hid_device *hdev)
  */
 void hid_destroy_device(struct hid_device *hdev)
 {
-	hid_bpf_destroy_device(hdev);
 	hid_remove_device(hdev);
 	put_device(&hdev->dev);
 }
@@ -2918,15 +2905,6 @@ int hid_check_keys_pressed(struct hid_device *hid)
 }
 EXPORT_SYMBOL_GPL(hid_check_keys_pressed);
 
-#ifdef CONFIG_HID_BPF
-static struct hid_bpf_ops hid_ops = {
-	.hid_get_report = hid_get_report,
-	.hid_hw_raw_request = hid_hw_raw_request,
-	.owner = THIS_MODULE,
-	.bus_type = &hid_bus_type,
-};
-#endif
-
 static int __init hid_init(void)
 {
 	int ret;
@@ -2940,10 +2918,6 @@ static int __init hid_init(void)
 		pr_err("can't register hid bus\n");
 		goto err;
 	}
-
-#ifdef CONFIG_HID_BPF
-	hid_bpf_ops = &hid_ops;
-#endif
 
 	ret = hidraw_init();
 	if (ret)
@@ -2960,9 +2934,6 @@ err:
 
 static void __exit hid_exit(void)
 {
-#ifdef CONFIG_HID_BPF
-	hid_bpf_ops = NULL;
-#endif
 	hid_debug_exit();
 	hidraw_exit();
 	bus_unregister(&hid_bus_type);

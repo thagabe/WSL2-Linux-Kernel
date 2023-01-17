@@ -27,7 +27,7 @@
 #include <linux/mutex.h>
 #include <linux/ftrace.h>
 #include <linux/refcount.h>
-#include <linux/objpool.h>
+#include <linux/freelist.h>
 #include <linux/rethook.h>
 #include <asm/kprobes.h>
 
@@ -141,7 +141,6 @@ static inline bool kprobe_ftrace(struct kprobe *p)
  */
 struct kretprobe_holder {
 	struct kretprobe	*rp;
-	struct objpool_head	oh;
 	refcount_t		ref;
 };
 
@@ -155,6 +154,7 @@ struct kretprobe {
 #ifdef CONFIG_KRETPROBE_ON_RETHOOK
 	struct rethook *rh;
 #else
+	struct freelist_head freelist;
 	struct kretprobe_holder *rph;
 #endif
 };
@@ -165,7 +165,10 @@ struct kretprobe_instance {
 #ifdef CONFIG_KRETPROBE_ON_RETHOOK
 	struct rethook_node node;
 #else
-	struct rcu_head rcu;
+	union {
+		struct freelist_node freelist;
+		struct rcu_head rcu;
+	};
 	struct llist_node llist;
 	struct kretprobe_holder *rph;
 	kprobe_opcode_t *ret_addr;

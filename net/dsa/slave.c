@@ -22,7 +22,54 @@
 #include <net/dcbnl.h>
 #include <linux/netpoll.h>
 
-#include "dsa_priv.h"
+#include "dsa.h"
+#include "port.h"
+#include "master.h"
+#include "netlink.h"
+#include "slave.h"
+#include "tag.h"
+
+struct dsa_switchdev_event_work {
+	struct net_device *dev;
+	struct net_device *orig_dev;
+	struct work_struct work;
+	unsigned long event;
+	/* Specific for SWITCHDEV_FDB_ADD_TO_DEVICE and
+	 * SWITCHDEV_FDB_DEL_TO_DEVICE
+	 */
+	unsigned char addr[ETH_ALEN];
+	u16 vid;
+	bool host_addr;
+};
+
+enum dsa_standalone_event {
+	DSA_UC_ADD,
+	DSA_UC_DEL,
+	DSA_MC_ADD,
+	DSA_MC_DEL,
+};
+
+struct dsa_standalone_event_work {
+	struct work_struct work;
+	struct net_device *dev;
+	enum dsa_standalone_event event;
+	unsigned char addr[ETH_ALEN];
+	u16 vid;
+};
+
+static bool dsa_switch_supports_uc_filtering(struct dsa_switch *ds)
+{
+	return ds->ops->port_fdb_add && ds->ops->port_fdb_del &&
+	       ds->fdb_isolation && !ds->vlan_filtering_is_global &&
+	       !ds->needs_standalone_vlan_filtering;
+}
+
+static bool dsa_switch_supports_mc_filtering(struct dsa_switch *ds)
+{
+	return ds->ops->port_mdb_add && ds->ops->port_mdb_del &&
+	       ds->fdb_isolation && !ds->vlan_filtering_is_global &&
+	       !ds->needs_standalone_vlan_filtering;
+}
 
 static void dsa_slave_standalone_event_work(struct work_struct *work)
 {
@@ -2366,16 +2413,25 @@ int dsa_slave_create(struct dsa_port *port)
 {
 	struct net_device *master = dsa_port_to_master(port);
 	struct dsa_switch *ds = port->ds;
-	const char *name = port->name;
 	struct net_device *slave_dev;
 	struct dsa_slave_priv *p;
+	const char *name;
+	int assign_type;
 	int ret;
 
 	if (!ds->num_tx_queues)
 		ds->num_tx_queues = 1;
 
+	if (port->name) {
+		name = port->name;
+		assign_type = NET_NAME_PREDICTABLE;
+	} else {
+		name = "eth%d";
+		assign_type = NET_NAME_ENUM;
+	}
+
 	slave_dev = alloc_netdev_mqs(sizeof(struct dsa_slave_priv), name,
-				     NET_NAME_UNKNOWN, ether_setup,
+				     assign_type, ether_setup,
 				     ds->num_tx_queues, 1);
 	if (slave_dev == NULL)
 		return -ENOMEM;

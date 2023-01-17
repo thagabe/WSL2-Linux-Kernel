@@ -586,13 +586,13 @@ static int aspeed_video_start_frame(struct aspeed_video *video)
 	bool bcd_buf_need = (video->format != VIDEO_FMT_STANDARD);
 
 	if (video->v4l2_input_status) {
-		v4l2_warn(&video->v4l2_dev, "No signal; don't start frame\n");
+		v4l2_dbg(1, debug, &video->v4l2_dev, "No signal; don't start frame\n");
 		return 0;
 	}
 
 	if (!(seq_ctrl & VE_SEQ_CTRL_COMP_BUSY) ||
 	    !(seq_ctrl & VE_SEQ_CTRL_CAP_BUSY)) {
-		v4l2_warn(&video->v4l2_dev, "Engine busy; don't start frame\n");
+		v4l2_dbg(1, debug, &video->v4l2_dev, "Engine busy; don't start frame\n");
 		return -EBUSY;
 	}
 
@@ -615,7 +615,7 @@ static int aspeed_video_start_frame(struct aspeed_video *video)
 				       struct aspeed_video_buffer, link);
 	if (!buf) {
 		spin_unlock_irqrestore(&video->lock, flags);
-		v4l2_warn(&video->v4l2_dev, "No buffers; don't start frame\n");
+		v4l2_dbg(1, debug, &video->v4l2_dev, "No buffers; don't start frame\n");
 		return -EPROTO;
 	}
 
@@ -796,7 +796,7 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 			if (video->format == VIDEO_FMT_STANDARD &&
 			    list_is_last(&buf->link, &video->buffers)) {
 				empty = false;
-				v4l2_warn(&video->v4l2_dev, "skip to keep last frame updated\n");
+				v4l2_dbg(1, debug, &video->v4l2_dev, "skip to keep last frame updated\n");
 			} else {
 				buf->vb.vb2_buf.timestamp = ktime_get_ns();
 				buf->vb.sequence = video->sequence++;
@@ -1060,7 +1060,7 @@ static void aspeed_video_get_resolution(struct aspeed_video *video)
 						      res_check(video),
 						      MODE_DETECT_TIMEOUT);
 		if (!rc) {
-			v4l2_warn(&video->v4l2_dev, "Timed out; first mode detect\n");
+			v4l2_dbg(1, debug, &video->v4l2_dev, "Timed out; first mode detect\n");
 			clear_bit(VIDEO_RES_DETECT, &video->flags);
 			return;
 		}
@@ -1081,7 +1081,7 @@ static void aspeed_video_get_resolution(struct aspeed_video *video)
 						      MODE_DETECT_TIMEOUT);
 		clear_bit(VIDEO_RES_DETECT, &video->flags);
 		if (!rc) {
-			v4l2_warn(&video->v4l2_dev, "Timed out; second mode detect\n");
+			v4l2_dbg(1, debug, &video->v4l2_dev, "Timed out; second mode detect\n");
 			return;
 		}
 
@@ -1104,7 +1104,7 @@ static void aspeed_video_get_resolution(struct aspeed_video *video)
 	} while (invalid_resolution && (tries++ < INVALID_RESOLUTION_RETRIES));
 
 	if (invalid_resolution) {
-		v4l2_warn(&video->v4l2_dev, "Invalid resolution detected\n");
+		v4l2_dbg(1, debug, &video->v4l2_dev, "Invalid resolution detected\n");
 		return;
 	}
 
@@ -1855,7 +1855,7 @@ static void aspeed_video_stop_streaming(struct vb2_queue *q)
 				!test_bit(VIDEO_FRAME_INPRG, &video->flags),
 				STOP_TIMEOUT);
 	if (!rc) {
-		v4l2_warn(&video->v4l2_dev, "Timed out when stopping streaming\n");
+		v4l2_dbg(1, debug, &video->v4l2_dev, "Timed out when stopping streaming\n");
 
 		/*
 		 * Need to force stop any DMA and try and get HW into a good
@@ -1961,19 +1961,7 @@ static int aspeed_video_debugfs_show(struct seq_file *s, void *data)
 
 	return 0;
 }
-
-static int aspeed_video_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, aspeed_video_debugfs_show, inode->i_private);
-}
-
-static const struct file_operations aspeed_video_debugfs_ops = {
-	.owner   = THIS_MODULE,
-	.open    = aspeed_video_proc_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-};
+DEFINE_SHOW_ATTRIBUTE(aspeed_video_debugfs);
 
 static struct dentry *debugfs_entry;
 
@@ -1987,7 +1975,7 @@ static int aspeed_video_debugfs_create(struct aspeed_video *video)
 {
 	debugfs_entry = debugfs_create_file(DEVICE_NAME, 0444, NULL,
 					    video,
-					    &aspeed_video_debugfs_ops);
+					    &aspeed_video_debugfs_fops);
 	if (!debugfs_entry)
 		aspeed_video_debugfs_remove(video);
 

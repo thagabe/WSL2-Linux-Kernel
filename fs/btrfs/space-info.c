@@ -1729,7 +1729,7 @@ static int __reserve_bytes(struct btrfs_fs_info *fs_info,
 		}
 	}
 	spin_unlock(&space_info->lock);
-	if (!ret || flush == BTRFS_RESERVE_NO_FLUSH)
+	if (!ret || !can_ticket(flush))
 		return ret;
 
 	return handle_reserve_ticket(fs_info, space_info, &ticket, start_ns,

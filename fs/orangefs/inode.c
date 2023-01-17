@@ -53,7 +53,7 @@ static int orangefs_writepage_locked(struct page *page,
 	bv.bv_len = wlen;
 	bv.bv_offset = off % PAGE_SIZE;
 	WARN_ON(wlen == 0);
-	iov_iter_bvec(&iter, WRITE, &bv, 1, wlen);
+	iov_iter_bvec(&iter, ITER_SOURCE, &bv, 1, wlen);
 
 	ret = wait_for_direct_io(ORANGEFS_IO_WRITE, inode, &off, &iter, wlen,
 	    len, wr, NULL, NULL);
@@ -112,7 +112,7 @@ static int orangefs_writepages_work(struct orangefs_writepages *ow,
 		else
 			ow->bv[i].bv_offset = 0;
 	}
-	iov_iter_bvec(&iter, WRITE, ow->bv, ow->npages, ow->len);
+	iov_iter_bvec(&iter, ITER_SOURCE, ow->bv, ow->npages, ow->len);
 
 	WARN_ON(ow->off >= len);
 	if (ow->off + ow->len > len)
@@ -270,7 +270,7 @@ static void orangefs_readahead(struct readahead_control *rac)
 	offset = readahead_pos(rac);
 	i_pages = &rac->mapping->i_pages;
 
-	iov_iter_xarray(&iter, READ, i_pages, offset, readahead_length(rac));
+	iov_iter_xarray(&iter, ITER_DEST, i_pages, offset, readahead_length(rac));
 
 	/* read in the pages. */
 	if ((ret = wait_for_direct_io(ORANGEFS_IO_READ, inode,
@@ -303,7 +303,7 @@ static int orangefs_read_folio(struct file *file, struct folio *folio)
 	bv.bv_page = &folio->page;
 	bv.bv_len = folio_size(folio);
 	bv.bv_offset = 0;
-	iov_iter_bvec(&iter, READ, &bv, 1, folio_size(folio));
+	iov_iter_bvec(&iter, ITER_DEST, &bv, 1, folio_size(folio));
 
 	ret = wait_for_direct_io(ORANGEFS_IO_READ, inode, &off, &iter,
 			folio_size(folio), inode->i_size, NULL, NULL, file);
@@ -530,7 +530,6 @@ static ssize_t orangefs_direct_IO(struct kiocb *iocb,
 	size_t count = iov_iter_count(iter);
 	ssize_t total_count = 0;
 	ssize_t ret = -EINVAL;
-	int i = 0;
 
 	gossip_debug(GOSSIP_FILE_DEBUG,
 		"%s-BEGIN(%pU): count(%d) after estimate_max_iovecs.\n",
@@ -556,7 +555,6 @@ static ssize_t orangefs_direct_IO(struct kiocb *iocb,
 	while (iov_iter_count(iter)) {
 		size_t each_count = iov_iter_count(iter);
 		size_t amt_complete;
-		i++;
 
 		/* how much to transfer in this loop iteration */
 		if (each_count > orangefs_bufmap_size_query())

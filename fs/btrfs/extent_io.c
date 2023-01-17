@@ -20,7 +20,7 @@
 #include "extent_map.h"
 #include "ctree.h"
 #include "btrfs_inode.h"
-#include "volumes.h"
+#include "bio.h"
 #include "check-integrity.h"
 #include "locking.h"
 #include "rcu-string.h"
@@ -104,6 +104,15 @@ struct btrfs_bio_ctrl {
 	btrfs_bio_end_io_t end_io_func;
 
 	/*
+	 * This is for metadata read, to provide the extra needed verification
+	 * info.  This has to be provided for submit_one_bio(), as
+	 * submit_one_bio() can submit a bio if it ends at stripe boundary.  If
+	 * no such parent_check is provided, the metadata can hit false alert at
+	 * endio time.
+	 */
+	struct btrfs_tree_parent_check *parent_check;
+
+	/*
 	 * Tell writepage not to lock the state bits for this range, it still
 	 * does the unlocking.
 	 */
@@ -133,13 +142,24 @@ static void submit_one_bio(struct btrfs_bio_ctrl *bio_ctrl)
 
 	btrfs_bio(bio)->file_offset = page_offset(bv->bv_page) + bv->bv_offset;
 
-	if (!is_data_inode(&inode->vfs_inode))
+	if (!is_data_inode(&inode->vfs_inode)) {
+		if (btrfs_op(bio) != BTRFS_MAP_WRITE) {
+			/*
+			 * For metadata read, we should have the parent_check,
+			 * and copy it to bbio for metadata verification.
+			 */
+			ASSERT(bio_ctrl->parent_check);
+			memcpy(&btrfs_bio(bio)->parent_check,
+			       bio_ctrl->parent_check,
+			       sizeof(struct btrfs_tree_parent_check));
+		}
 		btrfs_submit_metadata_bio(inode, bio, mirror_num);
-	else if (btrfs_op(bio) == BTRFS_MAP_WRITE)
+	} else if (btrfs_op(bio) == BTRFS_MAP_WRITE) {
 		btrfs_submit_data_write_bio(inode, bio, mirror_num);
-	else
+	} else {
 		btrfs_submit_data_read_bio(inode, bio, mirror_num,
 					   bio_ctrl->compress_type);
+	}
 
 	/* The bio is owned by the end_io handler now */
 	bio_ctrl->bio = NULL;
@@ -531,120 +551,6 @@ static void free_io_failure(struct btrfs_inode *inode,
 	kfree(rec);
 }
 
-/*
- * this bypasses the standard btrfs submit functions deliberately, as
- * the standard behavior is to write all copies in a raid setup. here we only
- * want to write the one bad copy. so we do the mapping for ourselves and issue
- * submit_bio directly.
- * to avoid any synchronization issues, wait for the data after writing, which
- * actually prevents the read that triggered the error from finishing.
- * currently, there can be no more than two copies of every data bit. thus,
- * exactly one rewrite is required.
- */
-static int repair_io_failure(struct btrfs_fs_info *fs_info, u64 ino, u64 start,
-			     u64 length, u64 logical, struct page *page,
-			     unsigned int pg_offset, int mirror_num)
-{
-	struct btrfs_device *dev;
-	struct bio_vec bvec;
-	struct bio bio;
-	u64 map_length = 0;
-	u64 sector;
-	struct btrfs_io_context *bioc = NULL;
-	int ret = 0;
-
-	ASSERT(!(fs_info->sb->s_flags & SB_RDONLY));
-	BUG_ON(!mirror_num);
-
-	if (btrfs_repair_one_zone(fs_info, logical))
-		return 0;
-
-	map_length = length;
-
-	/*
-	 * Avoid races with device replace and make sure our bioc has devices
-	 * associated to its stripes that don't go away while we are doing the
-	 * read repair operation.
-	 */
-	btrfs_bio_counter_inc_blocked(fs_info);
-	if (btrfs_is_parity_mirror(fs_info, logical, length)) {
-		/*
-		 * Note that we don't use BTRFS_MAP_WRITE because it's supposed
-		 * to update all raid stripes, but here we just want to correct
-		 * bad stripe, thus BTRFS_MAP_READ is abused to only get the bad
-		 * stripe's dev and sector.
-		 */
-		ret = btrfs_map_block(fs_info, BTRFS_MAP_READ, logical,
-				      &map_length, &bioc, 0);
-		if (ret)
-			goto out_counter_dec;
-		ASSERT(bioc->mirror_num == 1);
-	} else {
-		ret = btrfs_map_block(fs_info, BTRFS_MAP_WRITE, logical,
-				      &map_length, &bioc, mirror_num);
-		if (ret)
-			goto out_counter_dec;
-		BUG_ON(mirror_num != bioc->mirror_num);
-	}
-
-	sector = bioc->stripes[bioc->mirror_num - 1].physical >> 9;
-	dev = bioc->stripes[bioc->mirror_num - 1].dev;
-	btrfs_put_bioc(bioc);
-
-	if (!dev || !dev->bdev ||
-	    !test_bit(BTRFS_DEV_STATE_WRITEABLE, &dev->dev_state)) {
-		ret = -EIO;
-		goto out_counter_dec;
-	}
-
-	bio_init(&bio, dev->bdev, &bvec, 1, REQ_OP_WRITE | REQ_SYNC);
-	bio.bi_iter.bi_sector = sector;
-	__bio_add_page(&bio, page, length, pg_offset);
-
-	btrfsic_check_bio(&bio);
-	ret = submit_bio_wait(&bio);
-	if (ret) {
-		/* try to remap that extent elsewhere? */
-		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_WRITE_ERRS);
-		goto out_bio_uninit;
-	}
-
-	btrfs_info_rl_in_rcu(fs_info,
-		"read error corrected: ino %llu off %llu (dev %s sector %llu)",
-				  ino, start,
-				  rcu_str_deref(dev->name), sector);
-	ret = 0;
-
-out_bio_uninit:
-	bio_uninit(&bio);
-out_counter_dec:
-	btrfs_bio_counter_dec(fs_info);
-	return ret;
-}
-
-int btrfs_repair_eb_io_failure(const struct extent_buffer *eb, int mirror_num)
-{
-	struct btrfs_fs_info *fs_info = eb->fs_info;
-	u64 start = eb->start;
-	int i, num_pages = num_extent_pages(eb);
-	int ret = 0;
-
-	if (sb_rdonly(fs_info->sb))
-		return -EROFS;
-
-	for (i = 0; i < num_pages; i++) {
-		struct page *p = eb->pages[i];
-
-		ret = repair_io_failure(fs_info, 0, start, PAGE_SIZE, start, p,
-					start - page_offset(p), mirror_num);
-		if (ret)
-			break;
-		start += PAGE_SIZE;
-	}
-
-	return ret;
-}
-
 static int next_mirror(const struct io_failure_record *failrec, int cur_mirror)
 {
 	if (cur_mirror == failrec->num_copies)
@@ -692,7 +598,7 @@ int btrfs_clean_io_failure(struct btrfs_inode *inode, u64 start,
 	mirror = failrec->this_mirror;
 	do {
 		mirror = prev_mirror(failrec, mirror);
-		repair_io_failure(fs_info, ino, start, failrec->len,
+		btrfs_repair_io_failure(fs_info, ino, start, failrec->len,
 				  failrec->logical, page, pg_offset, mirror);
 	} while (mirror != failrec->failed_mirror);
 
@@ -823,7 +729,7 @@ int btrfs_repair_one_sector(struct btrfs_inode *inode, struct btrfs_bio *failed_
 	 *
 	 * Since we're only doing repair for one sector, we only need to get
 	 * a good copy of the failed sector and if we succeed, we have setup
-	 * everything for repair_io_failure to do the rest for us.
+	 * everything for btrfs_repair_io_failure to do the rest for us.
 	 */
 	failrec->this_mirror = next_mirror(failrec, failrec->this_mirror);
 	if (failrec->this_mirror == failrec->failed_mirror) {
@@ -2643,15 +2549,19 @@ static void prepare_eb_write(struct extent_buffer *eb)
 	/* Set btree blocks beyond nritems with 0 to avoid stale content */
 	nritems = btrfs_header_nritems(eb);
 	if (btrfs_header_level(eb) > 0) {
-		end = btrfs_node_key_ptr_offset(nritems);
+		end = btrfs_node_key_ptr_offset(eb, nritems);
 		memzero_extent_buffer(eb, end, eb->len - end);
 	} else {
 		/*
 		 * Leaf:
 		 * header 0 1 2 .. N ... data_N .. data_2 data_1 data_0
 		 */
-		start = btrfs_item_nr_offset(nritems);
-		end = BTRFS_LEAF_DATA_OFFSET + leaf_data_end(eb);
+		start = btrfs_item_nr_offset(eb, nritems);
+		end = btrfs_item_nr_offset(eb, 0);
+		if (nritems == 0)
+			end += BTRFS_LEAF_DATA_SIZE(eb->fs_info);
+		else
+			end += btrfs_item_offset(eb, nritems - 1);
 		memzero_extent_buffer(eb, start, end - start);
 	}
 }
@@ -4939,6 +4849,7 @@ static int read_extent_buffer_subpage(struct extent_buffer *eb, int wait,
 	struct extent_state *cached_state = NULL;
 	struct btrfs_bio_ctrl bio_ctrl = {
 		.mirror_num = mirror_num,
+		.parent_check = check,
 	};
 	int ret = 0;
 
@@ -4988,7 +4899,6 @@ static int read_extent_buffer_subpage(struct extent_buffer *eb, int wait,
 		 */
 		atomic_dec(&eb->io_pages);
 	}
-	memcpy(&btrfs_bio(bio_ctrl.bio)->parent_check, check, sizeof(*check));
 	submit_one_bio(&bio_ctrl);
 	if (ret || wait != WAIT_COMPLETE) {
 		free_extent_state(cached_state);
@@ -5015,6 +4925,7 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
 	unsigned long num_reads = 0;
 	struct btrfs_bio_ctrl bio_ctrl = {
 		.mirror_num = mirror_num,
+		.parent_check = check,
 	};
 
 	if (test_bit(EXTENT_BUFFER_UPTODATE, &eb->bflags))
@@ -5106,7 +5017,6 @@ int read_extent_buffer_pages(struct extent_buffer *eb, int wait, int mirror_num,
 		}
 	}
 
-	memcpy(&btrfs_bio(bio_ctrl.bio)->parent_check, check, sizeof(*check));
 	submit_one_bio(&bio_ctrl);
 
 	if (ret || wait != WAIT_COMPLETE)

@@ -17,6 +17,7 @@
 #include <linux/errno.h>
 
 #include "io_pagetable.h"
+#include "double_span.h"
 
 struct iopt_pages_list {
 	struct iopt_pages *pages;
@@ -68,12 +69,12 @@ struct iopt_area *iopt_area_contig_next(struct iopt_area_contig_iter *iter)
 	return iter->area;
 }
 
-static bool __alloc_iova_check_hole(struct interval_tree_span_iter *span,
+static bool __alloc_iova_check_hole(struct interval_tree_double_span_iter *span,
 				    unsigned long length,
 				    unsigned long iova_alignment,
 				    unsigned long page_offset)
 {
-	if (!span->is_hole || span->last_hole - span->start_hole < length - 1)
+	if (span->is_used || span->last_hole - span->start_hole < length - 1)
 		return false;
 
 	span->start_hole = ALIGN(span->start_hole, iova_alignment) |
@@ -107,10 +108,9 @@ static bool __alloc_iova_check_used(struct interval_tree_span_iter *span,
 static int iopt_alloc_iova(struct io_pagetable *iopt, unsigned long *iova,
 			   unsigned long uptr, unsigned long length)
 {
-	struct interval_tree_span_iter reserved_span;
 	unsigned long page_offset = uptr % PAGE_SIZE;
+	struct interval_tree_double_span_iter used_span;
 	struct interval_tree_span_iter allowed_span;
-	struct interval_tree_span_iter area_span;
 	unsigned long iova_alignment;
 
 	lockdep_assert_held(&iopt->iova_rwsem);
@@ -145,26 +145,16 @@ static int iopt_alloc_iova(struct io_pagetable *iopt, unsigned long *iova,
 					     iova_alignment, page_offset))
 			continue;
 
-		interval_tree_for_each_span(&area_span, &iopt->area_itree,
-					    allowed_span.start_used,
-					    allowed_span.last_used) {
-			if (!__alloc_iova_check_hole(&area_span, length,
+		interval_tree_for_each_double_span(
+			&used_span, &iopt->reserved_itree, &iopt->area_itree,
+			allowed_span.start_used, allowed_span.last_used) {
+			if (!__alloc_iova_check_hole(&used_span, length,
 						     iova_alignment,
 						     page_offset))
 				continue;
 
-			interval_tree_for_each_span(&reserved_span,
-						    &iopt->reserved_itree,
-						    area_span.start_used,
-						    area_span.last_used) {
-				if (!__alloc_iova_check_hole(
-					    &reserved_span, length,
-					    iova_alignment, page_offset))
-					continue;
-
-				*iova = reserved_span.start_hole;
-				return 0;
-			}
+			*iova = used_span.start_hole;
+			return 0;
 		}
 	}
 	return -ENOSPC;
@@ -185,11 +175,11 @@ static int iopt_check_iova(struct io_pagetable *iopt, unsigned long iova,
 
 	/* No reserved IOVA intersects the range */
 	if (iopt_reserved_iter_first(iopt, iova, last))
-		return -ENOENT;
+		return -EINVAL;
 
 	/* Check that there is not already a mapping in the range */
 	if (iopt_area_iter_first(iopt, iova, last))
-		return -EADDRINUSE;
+		return -EEXIST;
 	return 0;
 }
 
@@ -464,7 +454,7 @@ err_free:
 }
 
 static int iopt_unmap_iova_range(struct io_pagetable *iopt, unsigned long start,
-				 unsigned long end, unsigned long *unmapped)
+				 unsigned long last, unsigned long *unmapped)
 {
 	struct iopt_area *area;
 	unsigned long unmapped_bytes = 0;
@@ -478,7 +468,7 @@ static int iopt_unmap_iova_range(struct io_pagetable *iopt, unsigned long start,
 again:
 	down_read(&iopt->domains_rwsem);
 	down_write(&iopt->iova_rwsem);
-	while ((area = iopt_area_iter_first(iopt, start, end))) {
+	while ((area = iopt_area_iter_first(iopt, start, last))) {
 		unsigned long area_last = iopt_area_last_iova(area);
 		unsigned long area_first = iopt_area_iova(area);
 		struct iopt_pages *pages;
@@ -489,7 +479,7 @@ again:
 			goto out_unlock_iova;
 		}
 
-		if (area_first < start || area_last > end) {
+		if (area_first < start || area_last > last) {
 			rc = -ENOENT;
 			goto out_unlock_iova;
 		}
@@ -547,15 +537,15 @@ out_unlock_iova:
 int iopt_unmap_iova(struct io_pagetable *iopt, unsigned long iova,
 		    unsigned long length, unsigned long *unmapped)
 {
-	unsigned long iova_end;
+	unsigned long iova_last;
 
 	if (!length)
 		return -EINVAL;
 
-	if (check_add_overflow(iova, length - 1, &iova_end))
+	if (check_add_overflow(iova, length - 1, &iova_last))
 		return -EOVERFLOW;
 
-	return iopt_unmap_iova_range(iopt, iova, iova_end, unmapped);
+	return iopt_unmap_iova_range(iopt, iova, iova_last, unmapped);
 }
 
 int iopt_unmap_all(struct io_pagetable *iopt, unsigned long *unmapped)
@@ -915,6 +905,7 @@ static int iopt_calculate_iova_alignment(struct io_pagetable *iopt)
 	lockdep_assert_held_write(&iopt->iova_rwsem);
 	lockdep_assert_held(&iopt->domains_rwsem);
 
+	/* See batch_iommu_map_small() */
 	if (iopt->disable_large_pages)
 		new_iova_alignment = PAGE_SIZE;
 	else
@@ -1018,6 +1009,15 @@ static int iopt_area_split(struct iopt_area *area, unsigned long iova)
 
 	mutex_lock(&pages->mutex);
 	/*
+	 * Splitting is not permitted if an access exists, we don't track enough
+	 * information to split existing accesses.
+	 */
+	if (area->num_accesses) {
+		rc = -EINVAL;
+		goto err_unlock;
+	}
+
+	/*
 	 * Splitting is not permitted if a domain could have been mapped with
 	 * huge pages.
 	 */
@@ -1041,10 +1041,8 @@ static int iopt_area_split(struct iopt_area *area, unsigned long iova)
 		goto err_remove_lhs;
 
 	lhs->storage_domain = area->storage_domain;
-	lhs->num_accesses = area->num_accesses;
 	lhs->pages = area->pages;
 	rhs->storage_domain = area->storage_domain;
-	rhs->num_accesses = area->num_accesses;
 	rhs->pages = area->pages;
 	kref_get(&rhs->pages->kref);
 	kfree(area);
@@ -1172,6 +1170,8 @@ int iopt_table_enforce_group_resv_regions(struct io_pagetable *iopt,
 	struct iommu_resv_region *resv;
 	struct iommu_resv_region *tmp;
 	LIST_HEAD(group_resv_regions);
+	unsigned int num_hw_msi = 0;
+	unsigned int num_sw_msi = 0;
 	int rc;
 
 	down_write(&iopt->iova_rwsem);
@@ -1183,23 +1183,25 @@ int iopt_table_enforce_group_resv_regions(struct io_pagetable *iopt,
 		if (resv->type == IOMMU_RESV_DIRECT_RELAXABLE)
 			continue;
 
-		/*
-		 * The presence of any 'real' MSI regions should take precedence
-		 * over the software-managed one if the IOMMU driver happens to
-		 * advertise both types.
-		 */
-		if (sw_msi_start && resv->type == IOMMU_RESV_MSI) {
-			*sw_msi_start = 0;
-			sw_msi_start = NULL;
-		}
-		if (sw_msi_start && resv->type == IOMMU_RESV_SW_MSI)
+		if (sw_msi_start && resv->type == IOMMU_RESV_MSI)
+			num_hw_msi++;
+		if (sw_msi_start && resv->type == IOMMU_RESV_SW_MSI) {
 			*sw_msi_start = resv->start;
+			num_sw_msi++;
+		}
 
 		rc = iopt_reserve_iova(iopt, resv->start,
 				       resv->length - 1 + resv->start, device);
 		if (rc)
 			goto out_reserved;
 	}
+
+	/* Drivers must offer sane combinations of regions */
+	if (WARN_ON(num_sw_msi && num_hw_msi) || WARN_ON(num_sw_msi > 1)) {
+		rc = -EINVAL;
+		goto out_reserved;
+	}
+
 	rc = 0;
 	goto out_free_resv;
 

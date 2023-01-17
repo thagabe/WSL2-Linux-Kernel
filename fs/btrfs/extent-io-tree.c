@@ -395,7 +395,7 @@ static int insert_state(struct extent_io_tree *tree,
 			u32 bits, struct extent_changeset *changeset)
 {
 	struct rb_node **node;
-	struct rb_node *parent;
+	struct rb_node *parent = NULL;
 	const u64 end = state->end;
 
 	set_state_bits(tree, state, bits, changeset);
@@ -1425,7 +1425,7 @@ void find_first_clear_extent_bit(struct extent_io_tree *tree, u64 start,
 				 u64 *start_ret, u64 *end_ret, u32 bits)
 {
 	struct extent_state *state;
-	struct extent_state *prev = NULL, *next;
+	struct extent_state *prev = NULL, *next = NULL;
 
 	spin_lock(&tree->lock);
 
@@ -1551,7 +1551,7 @@ u64 count_range_bits(struct extent_io_tree *tree,
 	u64 last = 0;
 	int found = 0;
 
-	if (WARN_ON(search_end <= cur_start))
+	if (WARN_ON(search_end < cur_start))
 		return 0;
 
 	spin_lock(&tree->lock);

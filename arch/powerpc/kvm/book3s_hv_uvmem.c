@@ -689,14 +689,12 @@ unsigned long kvmppc_h_svm_init_abort(struct kvm *kvm)
  */
 static struct page *kvmppc_uvmem_get_page(unsigned long gpa, struct kvm *kvm)
 {
-	struct dev_pagemap *pgmap = &kvmppc_uvmem_pgmap;
+	struct page *dpage = NULL;
 	unsigned long bit, uvmem_pfn;
 	struct kvmppc_uvmem_page_pvt *pvt;
 	unsigned long pfn_last, pfn_first;
-	struct folio *folio;
-	struct page *dpage;
 
-	pfn_first = pgmap->range.start >> PAGE_SHIFT;
+	pfn_first = kvmppc_uvmem_pgmap.range.start >> PAGE_SHIFT;
 	pfn_last = pfn_first +
 		   (range_len(&kvmppc_uvmem_pgmap.range) >> PAGE_SHIFT);
 
@@ -718,11 +716,9 @@ static struct page *kvmppc_uvmem_get_page(unsigned long gpa, struct kvm *kvm)
 	pvt->gpa = gpa;
 	pvt->kvm = kvm;
 
-	folio = pgmap_request_folio(pgmap,
-				    pfn_to_pgmap_offset(pgmap, uvmem_pfn), 0);
-	dpage = &folio->page;
+	dpage = pfn_to_page(uvmem_pfn);
 	dpage->zone_device_data = pvt;
-	lock_page(dpage);
+	zone_device_page_init(dpage);
 	return dpage;
 out_clear:
 	spin_lock(&kvmppc_uvmem_bitmap_lock);
@@ -1194,8 +1190,7 @@ int kvmppc_uvmem_init(void)
 
 	pfn_first = res->start >> PAGE_SHIFT;
 	pfn_last = pfn_first + (resource_size(res) >> PAGE_SHIFT);
-	kvmppc_uvmem_bitmap = kcalloc(BITS_TO_LONGS(pfn_last - pfn_first),
-				      sizeof(unsigned long), GFP_KERNEL);
+	kvmppc_uvmem_bitmap = bitmap_zalloc(pfn_last - pfn_first, GFP_KERNEL);
 	if (!kvmppc_uvmem_bitmap) {
 		ret = -ENOMEM;
 		goto out_unmap;
@@ -1219,5 +1214,5 @@ void kvmppc_uvmem_free(void)
 	memunmap_pages(&kvmppc_uvmem_pgmap);
 	release_mem_region(kvmppc_uvmem_pgmap.range.start,
 			   range_len(&kvmppc_uvmem_pgmap.range));
-	kfree(kvmppc_uvmem_bitmap);
+	bitmap_free(kvmppc_uvmem_bitmap);
 }

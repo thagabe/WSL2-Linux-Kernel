@@ -42,6 +42,7 @@
 #include "root-tree.h"
 #include "file-item.h"
 #include "orphan.h"
+#include "tree-checker.h"
 
 #undef SCRAMBLE_DELAYED_REFS
 
@@ -1712,6 +1713,11 @@ static int run_one_delayed_ref(struct btrfs_trans_handle *trans,
 		BUG();
 	if (ret && insert_reserved)
 		btrfs_pin_extent(trans, node->bytenr, node->num_bytes, 1);
+	if (ret < 0)
+		btrfs_err(trans->fs_info,
+"failed to run delayed ref for logical %llu num_bytes %llu type %u action %u ref_mod %d: %d",
+			  node->bytenr, node->num_bytes, node->type,
+			  node->action, node->ref_mod, ret);
 	return ret;
 }
 
@@ -1953,8 +1959,6 @@ static int btrfs_run_delayed_refs_for_head(struct btrfs_trans_handle *trans,
 		if (ret) {
 			unselect_delayed_ref_head(delayed_refs, locked_ref);
 			btrfs_put_delayed_ref(ref);
-			btrfs_debug(fs_info, "run_one_delayed_ref returned %d",
-				    ret);
 			return ret;
 		}
 
@@ -6048,7 +6052,7 @@ static int btrfs_trim_free_extents(struct btrfs_device *device, u64 *trimmed)
 			btrfs_warn_in_rcu(fs_info,
 "ignoring attempt to trim beyond device size: offset %llu length %llu device %s device size %llu",
 					  start, end - start + 1,
-					  rcu_str_deref(device->name),
+					  btrfs_dev_name(device),
 					  device->total_bytes);
 			mutex_unlock(&fs_info->chunk_mutex);
 			ret = 0;

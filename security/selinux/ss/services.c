@@ -2013,6 +2013,7 @@ static inline int convert_context_handle_invalid_context(
  * @args: populated convert_context_args struct
  * @oldc: original context
  * @newc: converted context
+ * @gfp_flags: allocation flags
  *
  * Convert the values in the security context structure @oldc from the values
  * specified in the policy @args->oldp to the values specified in the policy

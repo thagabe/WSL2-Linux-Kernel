@@ -138,8 +138,7 @@ static int msm_hdmi_init(struct hdmi *hdmi)
 	return 0;
 
 fail:
-	if (hdmi)
-		msm_hdmi_destroy(hdmi);
+	msm_hdmi_destroy(hdmi);
 
 	return ret;
 }
@@ -533,11 +532,19 @@ static int msm_hdmi_dev_probe(struct platform_device *pdev)
 
 	ret = devm_pm_runtime_enable(&pdev->dev);
 	if (ret)
-		return ret;
+		goto err_put_phy;
 
 	platform_set_drvdata(pdev, hdmi);
 
-	return component_add(&pdev->dev, &msm_hdmi_ops);
+	ret = component_add(&pdev->dev, &msm_hdmi_ops);
+	if (ret)
+		goto err_put_phy;
+
+	return 0;
+
+err_put_phy:
+	msm_hdmi_put_phy(hdmi);
+	return ret;
 }
 
 static int msm_hdmi_dev_remove(struct platform_device *pdev)

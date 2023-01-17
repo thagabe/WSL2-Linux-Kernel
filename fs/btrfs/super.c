@@ -35,7 +35,7 @@
 #include "print-tree.h"
 #include "props.h"
 #include "xattr.h"
-#include "volumes.h"
+#include "bio.h"
 #include "export.h"
 #include "compression.h"
 #include "rcu-string.h"
@@ -1705,7 +1705,7 @@ static int btrfs_remount(struct super_block *sb, int *flags, char *data)
 	if (ret)
 		goto restore;
 
-	ret = btrfs_check_features(fs_info, sb);
+	ret = btrfs_check_features(fs_info, !(*flags & SB_RDONLY));
 	if (ret < 0)
 		goto restore;
 
@@ -2336,7 +2336,7 @@ static int btrfs_show_devname(struct seq_file *m, struct dentry *root)
 	 * the end of RCU grace period.
 	 */
 	rcu_read_lock();
-	seq_escape(m, rcu_str_deref(fs_info->fs_devices->latest_dev->name), " \t\n\\");
+	seq_escape(m, btrfs_dev_name(fs_info->fs_devices->latest_dev), " \t\n\\");
 	rcu_read_unlock();
 
 	return 0;
@@ -2514,6 +2514,7 @@ static __always_inline void btrfs_exit_btrfs_fs(void)
 static void __exit exit_btrfs_fs(void)
 {
 	btrfs_exit_btrfs_fs();
+	btrfs_cleanup_fs_uuids();
 }
 
 static int __init init_btrfs_fs(void)

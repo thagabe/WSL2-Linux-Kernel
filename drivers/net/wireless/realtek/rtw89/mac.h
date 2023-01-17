@@ -168,6 +168,8 @@ enum rtw89_mac_ax_l0_to_l1_event {
 	MAC_AX_L0_TO_L1_EVENT_MAX = 15,
 };
 
+#define RTW89_PORT_OFFSET_MS_TO_32US(n, shift_ms) ((n) * (shift_ms) * 1000 / 32)
+
 enum rtw89_mac_dbg_port_sel {
 	/* CMAC 0 related */
 	RTW89_DBG_PORT_SEL_PTCL_C0 = 0,
@@ -368,6 +370,15 @@ enum rtw89_mac_c2h_info_func {
 	RTW89_MAC_C2H_FUNC_INFO_MAX,
 };
 
+enum rtw89_mac_c2h_mcc_func {
+	RTW89_MAC_C2H_FUNC_MCC_RCV_ACK = 0,
+	RTW89_MAC_C2H_FUNC_MCC_REQ_ACK = 1,
+	RTW89_MAC_C2H_FUNC_MCC_TSF_RPT = 2,
+	RTW89_MAC_C2H_FUNC_MCC_STATUS_RPT = 3,
+
+	NUM_OF_RTW89_MAC_C2H_FUNC_MCC,
+};
+
 enum rtw89_mac_c2h_class {
 	RTW89_MAC_C2H_CLASS_INFO,
 	RTW89_MAC_C2H_CLASS_OFLD,
@@ -376,6 +387,31 @@ enum rtw89_mac_c2h_class {
 	RTW89_MAC_C2H_CLASS_MCC,
 	RTW89_MAC_C2H_CLASS_FWDBG,
 	RTW89_MAC_C2H_CLASS_MAX,
+};
+
+enum rtw89_mac_mcc_status {
+	RTW89_MAC_MCC_ADD_ROLE_OK = 0,
+	RTW89_MAC_MCC_START_GROUP_OK = 1,
+	RTW89_MAC_MCC_STOP_GROUP_OK = 2,
+	RTW89_MAC_MCC_DEL_GROUP_OK = 3,
+	RTW89_MAC_MCC_RESET_GROUP_OK = 4,
+	RTW89_MAC_MCC_SWITCH_CH_OK = 5,
+	RTW89_MAC_MCC_TXNULL0_OK = 6,
+	RTW89_MAC_MCC_TXNULL1_OK = 7,
+
+	RTW89_MAC_MCC_SWITCH_EARLY = 10,
+	RTW89_MAC_MCC_TBTT = 11,
+	RTW89_MAC_MCC_DURATION_START = 12,
+	RTW89_MAC_MCC_DURATION_END = 13,
+
+	RTW89_MAC_MCC_ADD_ROLE_FAIL = 20,
+	RTW89_MAC_MCC_START_GROUP_FAIL = 21,
+	RTW89_MAC_MCC_STOP_GROUP_FAIL = 22,
+	RTW89_MAC_MCC_DEL_GROUP_FAIL = 23,
+	RTW89_MAC_MCC_RESET_GROUP_FAIL = 24,
+	RTW89_MAC_MCC_SWITCH_CH_FAIL = 25,
+	RTW89_MAC_MCC_TXNULL0_FAIL = 26,
+	RTW89_MAC_MCC_TXNULL1_FAIL = 27,
 };
 
 struct rtw89_mac_ax_coex {
@@ -872,6 +908,7 @@ int rtw89_mac_add_vif(struct rtw89_dev *rtwdev, struct rtw89_vif *vif);
 int rtw89_mac_port_update(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif);
 void rtw89_mac_set_he_obss_narrow_bw_ru(struct rtw89_dev *rtwdev,
 					struct ieee80211_vif *vif);
+void rtw89_mac_stop_ap(struct rtw89_dev *rtwdev, struct rtw89_vif *rtwvif);
 int rtw89_mac_remove_vif(struct rtw89_dev *rtwdev, struct rtw89_vif *vif);
 void rtw89_mac_disable_cpu(struct rtw89_dev *rtwdev);
 int rtw89_mac_enable_cpu(struct rtw89_dev *rtwdev, u8 boot_reason, bool dlfw);
@@ -894,6 +931,7 @@ static inline int rtw89_chip_disable_bb_rf(struct rtw89_dev *rtwdev)
 
 u32 rtw89_mac_get_err_status(struct rtw89_dev *rtwdev);
 int rtw89_mac_set_err_status(struct rtw89_dev *rtwdev, u32 err);
+bool rtw89_mac_c2h_chk_atomic(struct rtw89_dev *rtwdev, u8 class, u8 func);
 void rtw89_mac_c2h_handle(struct rtw89_dev *rtwdev, struct sk_buff *skb,
 			  u32 len, u8 class, u8 func);
 int rtw89_mac_setup_phycap(struct rtw89_dev *rtwdev);

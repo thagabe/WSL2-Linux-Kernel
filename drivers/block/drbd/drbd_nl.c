@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-only
 /*
    drbd_nl.c
 
@@ -1543,7 +1543,7 @@ int drbd_adm_disk_opts(struct sk_buff *skb, struct genl_info *info)
 		goto fail_unlock;
 	}
 
-	if (!expect(new_disk_conf->resync_rate >= 1))
+	if (!expect(device, new_disk_conf->resync_rate >= 1))
 		new_disk_conf->resync_rate = 1;
 
 	sanitize_disk_conf(device, new_disk_conf, device->ldev);

@@ -35,7 +35,9 @@ description: |
         mdm9615
         msm8226
         msm8916
+        msm8956
         msm8974
+        msm8976
         msm8992
         msm8994
         msm8996
@@ -160,17 +162,29 @@ properties:
 
       - items:
           - enum:
+              - sony,kugo-row
+              - sony,suzu-row
+          - const: qcom,msm8956
+
+      - items:
+          - enum:
               - qcom,msm8960-cdp
           - const: qcom,msm8960
 
       - items:
           - enum:
-              - fairphone,fp2
               - lge,hammerhead
-              - samsung,klte
               - sony,xperia-amami
-              - sony,xperia-castor
               - sony,xperia-honami
+          - const: qcom,msm8974
+
+      - items:
+          - enum:
+              - fairphone,fp2
+              - oneplus,bacon
+              - samsung,klte
+              - sony,xperia-castor
+          - const: qcom,msm8974pro
           - const: qcom,msm8974
 
       - items:
@@ -655,6 +669,16 @@ properties:
           - const: google,villager-sku512
           - const: qcom,sc7280
 
+      - description: Google Zombie (newest rev)
+        items:
+          - const: google,zombie
+          - const: qcom,sc7280
+
+      - description: Google Zombie with LTE (newest rev)
+        items:
+          - const: google,zombie-sku512
+          - const: qcom,sc7280
+
       - items:
           - enum:
               - lenovo,flex-5g
@@ -735,6 +759,7 @@ properties:
       - items:
           - enum:
               - qcom,sa8295p-adp
+              - qcom,sa8540p-ride
           - const: qcom,sa8540p
 
       - items:
@@ -817,6 +842,7 @@ properties:
               - qcom,sm8450-hdk
               - qcom,sm8450-qrd
               - sony,pdx223
+              - sony,pdx224
           - const: qcom,sm8450
 
   # Board compatibles go above

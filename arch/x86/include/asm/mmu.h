@@ -9,11 +9,9 @@
 #include <linux/bits.h>
 
 /* Uprobes on this MM assume 32-bit code */
-#define MM_CONTEXT_UPROBE_IA32		BIT(0)
+#define MM_CONTEXT_UPROBE_IA32	BIT(0)
 /* vsyscall page is accessible on this MM */
-#define MM_CONTEXT_HAS_VSYSCALL		BIT(1)
-/* Allow LAM and SVA coexisting */
-#define MM_CONTEXT_FORCE_TAGGED_SVA	BIT(2)
+#define MM_CONTEXT_HAS_VSYSCALL	BIT(1)
 
 /*
  * x86 has arch-specific MMU state beyond what lives in mm_struct.
@@ -42,12 +40,6 @@ typedef struct {
 
 #ifdef CONFIG_X86_64
 	unsigned short flags;
-
-	/* Active LAM mode:  X86_CR3_LAM_U48 or X86_CR3_LAM_U57 or 0 (disabled) */
-	unsigned long lam_cr3_mask;
-
-	/* Significant bits of the virtual address. Excludes tag bits. */
-	u64 untag_mask;
 #endif
 
 	struct mutex lock;

@@ -349,8 +349,8 @@ static int vc4_hdmi_reset_link(struct drm_connector *connector,
 		return 0;
 
 	vc4_hdmi = connector_to_vc4_hdmi(connector);
-
 	mutex_lock(&vc4_hdmi->mutex);
+
 	if (!vc4_hdmi_supports_scrambling(vc4_hdmi)) {
 		mutex_unlock(&vc4_hdmi->mutex);
 		return 0;

@@ -193,18 +193,20 @@ static int iommufd_fops_release(struct inode *inode, struct file *filp)
 	struct iommufd_ctx *ictx = filp->private_data;
 	struct iommufd_object *obj;
 
-	/* Destroy the graph from depth first */
+	/*
+	 * The objects in the xarray form a graph of "users" counts, and we have
+	 * to destroy them in a depth first manner. Leaf objects will reduce the
+	 * users count of interior objects when they are destroyed.
+	 *
+	 * Repeatedly destroying all the "1 users" leaf objects will progress
+	 * until the entire list is destroyed. If this can't progress then there
+	 * is some bug related to object refcounting.
+	 */
 	while (!xa_empty(&ictx->objects)) {
 		unsigned int destroyed = 0;
 		unsigned long index;
 
 		xa_for_each(&ictx->objects, index, obj) {
-			/*
-			 * Since we are in release elevated users must come from
-			 * other objects holding the users. We will eventually
-			 * destroy the object that holds this one and the next
-			 * pass will progress it.
-			 */
 			if (!refcount_dec_if_one(&obj->users))
 				continue;
 			destroyed++;
@@ -224,6 +226,9 @@ static int iommufd_option(struct iommufd_ucmd *ucmd)
 {
 	struct iommu_option *cmd = ucmd->cmd;
 	int rc;
+
+	if (cmd->__reserved)
+		return -EOPNOTSUPP;
 
 	switch (cmd->option_id) {
 	case IOMMU_OPTION_RLIMIT_MODE:

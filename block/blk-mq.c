@@ -2951,8 +2951,11 @@ void blk_mq_submit_bio(struct bio *bio)
 	blk_status_t ret;
 
 	bio = blk_queue_bounce(bio, q);
-	if (bio_may_exceed_limits(bio, &q->limits))
+	if (bio_may_exceed_limits(bio, &q->limits)) {
 		bio = __bio_split_to_limits(bio, &q->limits, &nr_segs);
+		if (!bio)
+			return;
+	}
 
 	if (!bio_integrity_prep(bio))
 		return;
@@ -4108,9 +4111,14 @@ EXPORT_SYMBOL(__blk_mq_alloc_disk);
 struct gendisk *blk_mq_alloc_disk_for_queue(struct request_queue *q,
 		struct lock_class_key *lkclass)
 {
+	struct gendisk *disk;
+
 	if (!blk_get_queue(q))
 		return NULL;
-	return __alloc_disk_node(q, NUMA_NO_NODE, lkclass);
+	disk = __alloc_disk_node(q, NUMA_NO_NODE, lkclass);
+	if (!disk)
+		blk_put_queue(q);
+	return disk;
 }
 EXPORT_SYMBOL(blk_mq_alloc_disk_for_queue);
 
@@ -4385,7 +4393,7 @@ static int blk_mq_realloc_tag_set_tags(struct blk_mq_tag_set *set,
 	struct blk_mq_tags **new_tags;
 
 	if (set->nr_hw_queues >= new_nr_hw_queues)
-		return 0;
+		goto done;
 
 	new_tags = kcalloc_node(new_nr_hw_queues, sizeof(struct blk_mq_tags *),
 				GFP_KERNEL, set->numa_node);
@@ -4397,8 +4405,8 @@ static int blk_mq_realloc_tag_set_tags(struct blk_mq_tag_set *set,
 		       sizeof(*set->tags));
 	kfree(set->tags);
 	set->tags = new_tags;
+done:
 	set->nr_hw_queues = new_nr_hw_queues;
-
 	return 0;
 }
 
@@ -4634,9 +4642,9 @@ static bool blk_mq_elv_switch_none(struct list_head *head,
 
 	INIT_LIST_HEAD(&qe->node);
 	qe->q = q;
+	qe->type = q->elevator->type;
 	/* keep a reference to the elevator module as we'll switch back */
 	__elevator_get(qe->type);
-	qe->type = q->elevator->type;
 	list_add(&qe->node, head);
 	elevator_disable(q);
 	mutex_unlock(&q->sysfs_lock);

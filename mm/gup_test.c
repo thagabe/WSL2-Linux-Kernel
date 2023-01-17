@@ -4,6 +4,7 @@
 #include <linux/uaccess.h>
 #include <linux/ktime.h>
 #include <linux/debugfs.h>
+#include <linux/highmem.h>
 #include "gup_test.h"
 
 static void put_back_pages(unsigned int cmd, struct page **pages,
@@ -213,7 +214,7 @@ static inline void pin_longterm_test_stop(void)
 		if (pin_longterm_test_nr_pages)
 			unpin_user_pages(pin_longterm_test_pages,
 					 pin_longterm_test_nr_pages);
-		kfree(pin_longterm_test_pages);
+		kvfree(pin_longterm_test_pages);
 		pin_longterm_test_pages = NULL;
 		pin_longterm_test_nr_pages = 0;
 	}
@@ -254,7 +255,7 @@ static inline int pin_longterm_test_start(unsigned long arg)
 	fast = !!(args.flags & PIN_LONGTERM_TEST_FLAG_USE_FAST);
 
 	if (!fast && mmap_read_lock_killable(current->mm)) {
-		kfree(pages);
+		kvfree(pages);
 		return -EINTR;
 	}
 
@@ -297,10 +298,13 @@ static inline int pin_longterm_test_read(unsigned long arg)
 		return -EFAULT;
 
 	for (i = 0; i < pin_longterm_test_nr_pages; i++) {
-		void *addr = page_to_virt(pin_longterm_test_pages[i]);
+		void *addr = kmap_local_page(pin_longterm_test_pages[i]);
+		unsigned long ret;
 
-		if (copy_to_user((void __user *)(unsigned long)user_addr, addr,
-				 PAGE_SIZE))
+		ret = copy_to_user((void __user *)(unsigned long)user_addr, addr,
+				   PAGE_SIZE);
+		kunmap_local(addr);
+		if (ret)
 			return -EFAULT;
 		user_addr += PAGE_SIZE;
 	}

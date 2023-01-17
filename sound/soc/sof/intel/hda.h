@@ -294,6 +294,7 @@
 #define HDA_DSP_REG_ADSPIC2		(HDA_DSP_GEN_BASE + 0x10)
 #define HDA_DSP_REG_ADSPIS2		(HDA_DSP_GEN_BASE + 0x14)
 
+#define HDA_DSP_REG_ADSPIC2_SNDW	BIT(5)
 #define HDA_DSP_REG_ADSPIS2_SNDW	BIT(5)
 
 /* Intel HD Audio Inter-Processor Communication Registers */
@@ -591,6 +592,7 @@ int hda_dsp_resume(struct snd_sof_dev *sdev);
 int hda_dsp_runtime_suspend(struct snd_sof_dev *sdev);
 int hda_dsp_runtime_resume(struct snd_sof_dev *sdev);
 int hda_dsp_runtime_idle(struct snd_sof_dev *sdev);
+int hda_dsp_shutdown_dma_flush(struct snd_sof_dev *sdev);
 int hda_dsp_shutdown(struct snd_sof_dev *sdev);
 int hda_dsp_set_hw_params_upon_resume(struct snd_sof_dev *sdev);
 void hda_dsp_dump(struct snd_sof_dev *sdev, u32 flags);
@@ -794,16 +796,27 @@ int hda_dsp_trace_trigger(struct snd_sof_dev *sdev, int cmd);
  */
 #if IS_ENABLED(CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE)
 
+int hda_sdw_check_lcount_common(struct snd_sof_dev *sdev);
 int hda_sdw_startup(struct snd_sof_dev *sdev);
+void hda_common_enable_sdw_irq(struct snd_sof_dev *sdev, bool enable);
 void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable);
 void hda_sdw_process_wakeen(struct snd_sof_dev *sdev);
 bool hda_common_check_sdw_irq(struct snd_sof_dev *sdev);
 
 #else
 
+static inline int hda_sdw_check_lcount_common(struct snd_sof_dev *sdev)
+{
+	return 0;
+}
+
 static inline int hda_sdw_startup(struct snd_sof_dev *sdev)
 {
 	return 0;
+}
+
+static inline void hda_common_enable_sdw_irq(struct snd_sof_dev *sdev, bool enable)
+{
 }
 
 static inline void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable)

@@ -19,7 +19,7 @@ if LIBNVDIMM
 config BLK_DEV_PMEM
 	tristate "PMEM: Persistent memory block device support"
 	default LIBNVDIMM
-	select DAX if MMU
+	select DAX
 	select ND_BTT if BTT
 	select ND_PFN if NVDIMM_PFN
 	help
@@ -78,7 +78,6 @@ config NVDIMM_DAX
 	bool "NVDIMM DAX: Raw access to persistent memory"
 	default LIBNVDIMM
 	depends on NVDIMM_PFN
-	depends on DAX
 	help
 	  Support raw device dax access to a persistent memory
 	  namespace.  For environments that want to hard partition
@@ -114,5 +113,17 @@ config NVDIMM_TEST_BUILD
 	  otherwise helps catch build errors induced by changes to the
 	  core devm_memremap_pages() implementation and other
 	  infrastructure.
+
+config NVDIMM_SECURITY_TEST
+	bool "Enable NVDIMM security unit tests"
+	depends on NVDIMM_KEYS
+	help
+	  The NVDIMM and CXL subsystems support unit testing of their device
+	  security state machines. The NVDIMM_SECURITY_TEST option disables CPU
+	  cache maintenance operations around events like secure erase and
+	  overwrite.  Also, when enabled, the NVDIMM subsystem core helps the unit
+	  test implement a mock state machine.
+
+	  Select N if unsure.
 
 endif

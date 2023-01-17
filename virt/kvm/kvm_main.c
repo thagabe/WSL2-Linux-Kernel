@@ -1198,8 +1198,6 @@ static struct kvm *kvm_create_vm(unsigned long type, const char *fdname)
 			goto out_err_no_arch_destroy_vm;
 	}
 
-	kvm->max_halt_poll_ns = halt_poll_ns;
-
 	r = kvm_arch_init_vm(kvm, type);
 	if (r)
 		goto out_err_no_arch_destroy_vm;
@@ -1641,6 +1639,8 @@ static void kvm_commit_memory_region(struct kvm *kvm,
 				     const struct kvm_memory_slot *new,
 				     enum kvm_mr_change change)
 {
+	int old_flags = old ? old->flags : 0;
+	int new_flags = new ? new->flags : 0;
 	/*
 	 * Update the total number of memslot pages before calling the arch
 	 * hook so that architectures can consume the result directly.
@@ -1649,6 +1649,12 @@ static void kvm_commit_memory_region(struct kvm *kvm,
 		kvm->nr_memslot_pages -= old->npages;
 	else if (change == KVM_MR_CREATE)
 		kvm->nr_memslot_pages += new->npages;
+
+	if ((old_flags ^ new_flags) & KVM_MEM_LOG_DIRTY_PAGES) {
+		int change = (new_flags & KVM_MEM_LOG_DIRTY_PAGES) ? 1 : -1;
+		atomic_set(&kvm->nr_memslots_dirty_logging,
+			   atomic_read(&kvm->nr_memslots_dirty_logging) + change);
+	}
 
 	kvm_arch_commit_memory_region(kvm, old, new, change);
 
@@ -1943,22 +1949,12 @@ int __kvm_set_memory_region(struct kvm *kvm,
 		return -EINVAL;
 	if (mem->guest_phys_addr & (PAGE_SIZE - 1))
 		return -EINVAL;
-
-	/* Serialize against tagging enabling */
-	if (mmap_read_lock_killable(kvm->mm))
-		return -EINTR;
-
 	/* We can read the guest memory with __xxx_user() later on. */
 	if ((mem->userspace_addr & (PAGE_SIZE - 1)) ||
-	    (mem->userspace_addr != untagged_addr(kvm->mm, mem->userspace_addr)) ||
+	    (mem->userspace_addr != untagged_addr(mem->userspace_addr)) ||
 	     !access_ok((void __user *)(unsigned long)mem->userspace_addr,
-			mem->memory_size)) {
-		mmap_read_unlock(kvm->mm);
+			mem->memory_size))
 		return -EINVAL;
-	}
-
-	mmap_read_unlock(kvm->mm);
-
 	if (as_id >= KVM_ADDRESS_SPACE_NUM || id >= KVM_MEM_SLOTS_NUM)
 		return -EINVAL;
 	if (mem->guest_phys_addr + mem->memory_size < mem->guest_phys_addr)
@@ -2524,7 +2520,7 @@ static bool hva_to_pfn_fast(unsigned long addr, bool write_fault,
  * 1 indicates success, -errno is returned if error is detected.
  */
 static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
-			   bool *writable, kvm_pfn_t *pfn)
+			   bool interruptible, bool *writable, kvm_pfn_t *pfn)
 {
 	unsigned int flags = FOLL_HWPOISON;
 	struct page *page;
@@ -2539,6 +2535,8 @@ static int hva_to_pfn_slow(unsigned long addr, bool *async, bool write_fault,
 		flags |= FOLL_WRITE;
 	if (async)
 		flags |= FOLL_NOWAIT;
+	if (interruptible)
+		flags |= FOLL_INTERRUPTIBLE;
 
 	npages = get_user_pages_unlocked(addr, 1, &page, flags);
 	if (npages != 1)
@@ -2648,6 +2646,7 @@ out:
  * Pin guest page in memory and return its pfn.
  * @addr: host virtual address which maps memory to the guest
  * @atomic: whether this function can sleep
+ * @interruptible: whether the process can be interrupted by non-fatal signals
  * @async: whether this function need to wait IO complete if the
  *         host page is not in the memory
  * @write_fault: whether we should get a writable host page
@@ -2658,8 +2657,8 @@ out:
  * 2): @write_fault = false && @writable, @writable will tell the caller
  *     whether the mapping is writable.
  */
-kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool *async,
-		     bool write_fault, bool *writable)
+kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool interruptible,
+		     bool *async, bool write_fault, bool *writable)
 {
 	struct vm_area_struct *vma;
 	kvm_pfn_t pfn;
@@ -2674,9 +2673,12 @@ kvm_pfn_t hva_to_pfn(unsigned long addr, bool atomic, bool *async,
 	if (atomic)
 		return KVM_PFN_ERR_FAULT;
 
-	npages = hva_to_pfn_slow(addr, async, write_fault, writable, &pfn);
+	npages = hva_to_pfn_slow(addr, async, write_fault, interruptible,
+				 writable, &pfn);
 	if (npages == 1)
 		return pfn;
+	if (npages == -EINTR)
+		return KVM_PFN_ERR_SIGPENDING;
 
 	mmap_read_lock(current->mm);
 	if (npages == -EHWPOISON ||
@@ -2707,8 +2709,8 @@ exit:
 }
 
 kvm_pfn_t __gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn,
-			       bool atomic, bool *async, bool write_fault,
-			       bool *writable, hva_t *hva)
+			       bool atomic, bool interruptible, bool *async,
+			       bool write_fault, bool *writable, hva_t *hva)
 {
 	unsigned long addr = __gfn_to_hva_many(slot, gfn, NULL, write_fault);
 
@@ -2733,7 +2735,7 @@ kvm_pfn_t __gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn,
 		writable = NULL;
 	}
 
-	return hva_to_pfn(addr, atomic, async, write_fault,
+	return hva_to_pfn(addr, atomic, interruptible, async, write_fault,
 			  writable);
 }
 EXPORT_SYMBOL_GPL(__gfn_to_pfn_memslot);
@@ -2741,20 +2743,22 @@ EXPORT_SYMBOL_GPL(__gfn_to_pfn_memslot);
 kvm_pfn_t gfn_to_pfn_prot(struct kvm *kvm, gfn_t gfn, bool write_fault,
 		      bool *writable)
 {
-	return __gfn_to_pfn_memslot(gfn_to_memslot(kvm, gfn), gfn, false, NULL,
-				    write_fault, writable, NULL);
+	return __gfn_to_pfn_memslot(gfn_to_memslot(kvm, gfn), gfn, false, false,
+				    NULL, write_fault, writable, NULL);
 }
 EXPORT_SYMBOL_GPL(gfn_to_pfn_prot);
 
 kvm_pfn_t gfn_to_pfn_memslot(const struct kvm_memory_slot *slot, gfn_t gfn)
 {
-	return __gfn_to_pfn_memslot(slot, gfn, false, NULL, true, NULL, NULL);
+	return __gfn_to_pfn_memslot(slot, gfn, false, false, NULL, true,
+				    NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(gfn_to_pfn_memslot);
 
 kvm_pfn_t gfn_to_pfn_memslot_atomic(const struct kvm_memory_slot *slot, gfn_t gfn)
 {
-	return __gfn_to_pfn_memslot(slot, gfn, true, NULL, true, NULL, NULL);
+	return __gfn_to_pfn_memslot(slot, gfn, true, false, NULL, true,
+				    NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(gfn_to_pfn_memslot_atomic);
 
@@ -3388,9 +3392,6 @@ static void grow_halt_poll_ns(struct kvm_vcpu *vcpu)
 	if (val < grow_start)
 		val = grow_start;
 
-	if (val > vcpu->kvm->max_halt_poll_ns)
-		val = vcpu->kvm->max_halt_poll_ns;
-
 	vcpu->halt_poll_ns = val;
 out:
 	trace_kvm_halt_poll_ns_grow(vcpu->vcpu_id, val, old);
@@ -3494,6 +3495,24 @@ static inline void update_halt_poll_stats(struct kvm_vcpu *vcpu, ktime_t start,
 	}
 }
 
+static unsigned int kvm_vcpu_max_halt_poll_ns(struct kvm_vcpu *vcpu)
+{
+	struct kvm *kvm = vcpu->kvm;
+
+	if (kvm->override_halt_poll_ns) {
+		/*
+		 * Ensure kvm->max_halt_poll_ns is not read before
+		 * kvm->override_halt_poll_ns.
+		 *
+		 * Pairs with the smp_wmb() when enabling KVM_CAP_HALT_POLL.
+		 */
+		smp_rmb();
+		return READ_ONCE(kvm->max_halt_poll_ns);
+	}
+
+	return READ_ONCE(halt_poll_ns);
+}
+
 /*
  * Emulate a vCPU halt condition, e.g. HLT on x86, WFI on arm, etc...  If halt
  * polling is enabled, busy wait for a short time before blocking to avoid the
@@ -3502,21 +3521,23 @@ static inline void update_halt_poll_stats(struct kvm_vcpu *vcpu, ktime_t start,
  */
 void kvm_vcpu_halt(struct kvm_vcpu *vcpu)
 {
+	unsigned int max_halt_poll_ns = kvm_vcpu_max_halt_poll_ns(vcpu);
 	bool halt_poll_allowed = !kvm_arch_no_poll(vcpu);
-	bool do_halt_poll = halt_poll_allowed && vcpu->halt_poll_ns;
 	ktime_t start, cur, poll_end;
 	bool waited = false;
+	bool do_halt_poll;
 	u64 halt_ns;
+
+	if (vcpu->halt_poll_ns > max_halt_poll_ns)
+		vcpu->halt_poll_ns = max_halt_poll_ns;
+
+	do_halt_poll = halt_poll_allowed && vcpu->halt_poll_ns;
 
 	start = cur = poll_end = ktime_get();
 	if (do_halt_poll) {
 		ktime_t stop = ktime_add_ns(start, vcpu->halt_poll_ns);
 
 		do {
-			/*
-			 * This sets KVM_REQ_UNHALT if an interrupt
-			 * arrives.
-			 */
 			if (kvm_vcpu_check_block(vcpu) < 0)
 				goto out;
 			cpu_relax();
@@ -3546,18 +3567,21 @@ out:
 		update_halt_poll_stats(vcpu, start, poll_end, !waited);
 
 	if (halt_poll_allowed) {
+		/* Recompute the max halt poll time in case it changed. */
+		max_halt_poll_ns = kvm_vcpu_max_halt_poll_ns(vcpu);
+
 		if (!vcpu_valid_wakeup(vcpu)) {
 			shrink_halt_poll_ns(vcpu);
-		} else if (vcpu->kvm->max_halt_poll_ns) {
+		} else if (max_halt_poll_ns) {
 			if (halt_ns <= vcpu->halt_poll_ns)
 				;
 			/* we had a long block, shrink polling */
 			else if (vcpu->halt_poll_ns &&
-				 halt_ns > vcpu->kvm->max_halt_poll_ns)
+				 halt_ns > max_halt_poll_ns)
 				shrink_halt_poll_ns(vcpu);
 			/* we had a short halt and our poll time is too small */
-			else if (vcpu->halt_poll_ns < vcpu->kvm->max_halt_poll_ns &&
-				 halt_ns < vcpu->kvm->max_halt_poll_ns)
+			else if (vcpu->halt_poll_ns < max_halt_poll_ns &&
+				 halt_ns < max_halt_poll_ns)
 				grow_halt_poll_ns(vcpu);
 		} else {
 			vcpu->halt_poll_ns = 0;
@@ -3930,6 +3954,13 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	}
 
 	mutex_lock(&kvm->lock);
+
+#ifdef CONFIG_LOCKDEP
+	/* Ensure that lockdep knows vcpu->mutex is taken *inside* kvm->lock */
+	mutex_lock(&vcpu->mutex);
+	mutex_unlock(&vcpu->mutex);
+#endif
+
 	if (kvm_get_vcpu_by_id(kvm, id)) {
 		r = -EEXIST;
 		goto unlock_vcpu_destroy;
@@ -4609,6 +4640,16 @@ static int kvm_vm_ioctl_enable_cap_generic(struct kvm *kvm,
 			return -EINVAL;
 
 		kvm->max_halt_poll_ns = cap->args[0];
+
+		/*
+		 * Ensure kvm->override_halt_poll_ns does not become visible
+		 * before kvm->max_halt_poll_ns.
+		 *
+		 * Pairs with the smp_rmb() in kvm_vcpu_max_halt_poll_ns().
+		 */
+		smp_wmb();
+		kvm->override_halt_poll_ns = true;
+
 		return 0;
 	}
 	case KVM_CAP_DIRTY_LOG_RING:

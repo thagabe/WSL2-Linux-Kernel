@@ -143,12 +143,6 @@ config ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
 	select ZSMALLOC
 	help
 	  Use the zsmalloc allocator as the default allocator.
-
-config ZSWAP_ZPOOL_DEFAULT_ZBLOCK
-	bool "zblock"
-	select ZBLOCK
-	help
-	  Use the zblock allocator as the default allocator.
 endchoice
 
 config ZSWAP_ZPOOL_DEFAULT
@@ -157,7 +151,6 @@ config ZSWAP_ZPOOL_DEFAULT
        default "zbud" if ZSWAP_ZPOOL_DEFAULT_ZBUD
        default "z3fold" if ZSWAP_ZPOOL_DEFAULT_Z3FOLD
        default "zsmalloc" if ZSWAP_ZPOOL_DEFAULT_ZSMALLOC
-	default "zblock" if ZSWAP_ZPOOL_DEFAULT_ZBLOCK
        default ""
 
 config ZBUD
@@ -187,16 +180,6 @@ config ZSMALLOC
 	  zsmalloc is a slab-based memory allocator designed to store
 	  pages of various compression levels efficiently. It achieves
 	  the highest storage density with the least amount of fragmentation.
-
-config ZBLOCK
-	tristate "Simple block allocator (zblock)"
-	depends on ZPOOL
-	help
-	  A special purpose allocator for storing compressed pages.
-	  It stores integer number of compressed pages per block and
-	  each block consists of number of physical pages being a power of 2.
-	  zblock provides fast read/write, limited worst case time for
-	  operations and good compression ratio in most scenarios.
 
 config ZSMALLOC_STAT
 	bool "Export zsmalloc statistics"
@@ -236,16 +219,42 @@ config SLUB
 	   and has enhanced diagnostics. SLUB is the default choice for
 	   a slab allocator.
 
-config SLOB
+config SLOB_DEPRECATED
 	depends on EXPERT
-	bool "SLOB (Simple Allocator)"
+	bool "SLOB (Simple Allocator - DEPRECATED)"
 	depends on !PREEMPT_RT
 	help
+	   Deprecated and scheduled for removal in a few cycles. SLUB
+	   recommended as replacement. CONFIG_SLUB_TINY can be considered
+	   on systems with 16MB or less RAM.
+
+	   If you need SLOB to stay, please contact linux-mm@kvack.org and
+	   people listed in the SLAB ALLOCATOR section of MAINTAINERS file,
+	   with your use case.
+
 	   SLOB replaces the stock allocator with a drastically simpler
 	   allocator. SLOB is generally more space efficient but
 	   does not perform as well on large systems.
 
 endchoice
+
+config SLOB
+	bool
+	default y
+	depends on SLOB_DEPRECATED
+
+config SLUB_TINY
+	bool "Configure SLUB for minimal memory footprint"
+	depends on SLUB && EXPERT
+	select SLAB_MERGE_DEFAULT
+	help
+	   Configures the SLUB allocator in a way to achieve minimal memory
+	   footprint, sacrificing scalability, debugging and other features.
+	   This is intended only for the smallest system that had used the
+	   SLOB allocator and is not recommended for systems with more than
+	   16MB RAM.
+
+	   If unsure, say N.
 
 config SLAB_MERGE_DEFAULT
 	bool "Allow slab caches to be merged"
@@ -264,7 +273,7 @@ config SLAB_MERGE_DEFAULT
 
 config SLAB_FREELIST_RANDOM
 	bool "Randomize slab freelist"
-	depends on SLAB || SLUB
+	depends on SLAB || (SLUB && !SLUB_TINY)
 	help
 	  Randomizes the freelist order used on creating new pages. This
 	  security feature reduces the predictability of the kernel slab
@@ -272,7 +281,7 @@ config SLAB_FREELIST_RANDOM
 
 config SLAB_FREELIST_HARDENED
 	bool "Harden slab freelist metadata"
-	depends on SLAB || SLUB
+	depends on SLAB || (SLUB && !SLUB_TINY)
 	help
 	  Many kernel heap attacks try to target slab cache metadata and
 	  other infrastructure. This options makes minor performance
@@ -284,7 +293,7 @@ config SLAB_FREELIST_HARDENED
 config SLUB_STATS
 	default n
 	bool "Enable SLUB performance statistics"
-	depends on SLUB && SYSFS
+	depends on SLUB && SYSFS && !SLUB_TINY
 	help
 	  SLUB statistics are useful to debug SLUBs allocation behavior in
 	  order find ways to optimize the allocator. This should never be
@@ -296,7 +305,7 @@ config SLUB_STATS
 
 config SLUB_CPU_PARTIAL
 	default y
-	depends on SLUB && SMP
+	depends on SLUB && SMP && !SLUB_TINY
 	bool "SLUB per cpu partial cache"
 	help
 	  Per cpu partial caches accelerate objects allocation and freeing
@@ -1021,6 +1030,14 @@ config ARCH_USES_HIGH_VMA_FLAGS
 	bool
 config ARCH_HAS_PKEYS
 	bool
+
+config ARCH_USES_PG_ARCH_X
+	bool
+	help
+	  Enable the definition of PG_arch_x page flags with x > 1. Only
+	  suitable for 64-bit architectures with CONFIG_FLATMEM or
+	  CONFIG_SPARSEMEM_VMEMMAP enabled, otherwise there may not be
+	  enough room for additional bits in page->flags.
 
 config VM_EVENT_COUNTERS
 	default y

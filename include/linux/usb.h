@@ -259,32 +259,25 @@ struct usb_interface {
 	struct work_struct reset_ws;	/* for resets in atomic context */
 };
 
-static inline struct usb_interface *__to_usb_interface(struct device *d)
-{
-	return container_of(d, struct usb_interface, dev);
-}
-
-static inline const struct usb_interface *__to_usb_interface_const(const struct device *d)
-{
-	return container_of(d, struct usb_interface, dev);
-}
-
-/*
- * container_of() will happily take a const * and spit back a non-const * as it
- * is just doing pointer math.  But we want to be a bit more careful in the USB
- * driver code, so manually force any const * of a device to also be a const *
- * to a usb_device.
- */
-#define to_usb_interface(dev)						\
-	_Generic((dev),							\
-		 const struct device *: __to_usb_interface_const,	\
-		 struct device *: __to_usb_interface)(dev)
+#define to_usb_interface(__dev)	container_of_const(__dev, struct usb_interface, dev)
 
 static inline void *usb_get_intfdata(struct usb_interface *intf)
 {
 	return dev_get_drvdata(&intf->dev);
 }
 
+/**
+ * usb_set_intfdata() - associate driver-specific data with the interface
+ * @intf: the usb interface
+ * @data: pointer to the device priv structure or %NULL
+ *
+ * Drivers should use this function in their probe() to associate their
+ * driver-specific data with the usb interface.
+ *
+ * When disconnecting, the core will take care of setting @intf back to %NULL,
+ * so no actions are needed on the driver side. The interface should not be set
+ * to %NULL before all actions completed (e.g. no outsanding URB remaining).
+ */
 static inline void usb_set_intfdata(struct usb_interface *intf, void *data)
 {
 	dev_set_drvdata(&intf->dev, data);
@@ -730,26 +723,7 @@ struct usb_device {
 	unsigned use_generic_driver:1;
 };
 
-static inline struct usb_device *__to_usb_device(struct device *d)
-{
-	return container_of(d, struct usb_device, dev);
-}
-
-static inline const struct usb_device *__to_usb_device_const(const struct device *d)
-{
-	return container_of(d, struct usb_device, dev);
-}
-
-/*
- * container_of() will happily take a const * and spit back a non-const * as it
- * is just doing pointer math.  But we want to be a bit more careful in the USB
- * driver code, so manually force any const * of a device to also be a const *
- * to a usb_device.
- */
-#define to_usb_device(dev)					\
-	_Generic((dev),						\
-		 const struct device *: __to_usb_device_const,	\
-		 struct device *: __to_usb_device)(dev)
+#define to_usb_device(__dev)	container_of_const(__dev, struct usb_device, dev)
 
 static inline struct usb_device *__intf_to_usbdev(struct usb_interface *intf)
 {
@@ -1878,6 +1852,7 @@ static inline int usb_get_ptm_status(struct usb_device *dev, void *data)
 
 extern int usb_string(struct usb_device *dev, int index,
 	char *buf, size_t size);
+extern char *usb_cache_string(struct usb_device *udev, int index);
 
 /* wrappers that also update important state inside usbcore */
 extern int usb_clear_halt(struct usb_device *dev, int pipe);

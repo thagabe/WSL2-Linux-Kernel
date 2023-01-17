@@ -42,9 +42,6 @@ enum kasan_mode {
 
 extern enum kasan_mode kasan_mode __ro_after_init;
 
-extern unsigned long kasan_page_alloc_sample;
-DECLARE_PER_CPU(unsigned long, kasan_page_alloc_count);
-
 static inline bool kasan_vmalloc_enabled(void)
 {
 	return static_branch_likely(&kasan_flag_vmalloc);
@@ -60,13 +57,6 @@ static inline bool kasan_sync_fault_possible(void)
 	return kasan_mode == KASAN_MODE_SYNC || kasan_mode == KASAN_MODE_ASYMM;
 }
 
-static inline bool kasan_sample_page_alloc(void)
-{
-	unsigned long *count = this_cpu_ptr(&kasan_page_alloc_count);
-
-	return (*count)++ % kasan_page_alloc_sample == 0;
-}
-
 #else /* CONFIG_KASAN_HW_TAGS */
 
 static inline bool kasan_async_fault_possible(void)
@@ -75,11 +65,6 @@ static inline bool kasan_async_fault_possible(void)
 }
 
 static inline bool kasan_sync_fault_possible(void)
-{
-	return true;
-}
-
-static inline bool kasan_sample_page_alloc(void)
 {
 	return true;
 }
@@ -555,6 +540,18 @@ static inline bool kasan_arch_is_ready(void)	{ return true; }
 #elif !defined(CONFIG_KASAN_GENERIC) || !defined(CONFIG_KASAN_OUTLINE)
 #error kasan_arch_is_ready only works in KASAN generic outline mode!
 #endif
+
+#if IS_ENABLED(CONFIG_KASAN_KUNIT_TEST)
+
+void kasan_kunit_test_suite_start(void);
+void kasan_kunit_test_suite_end(void);
+
+#else /* CONFIG_KASAN_KUNIT_TEST */
+
+static inline void kasan_kunit_test_suite_start(void) { }
+static inline void kasan_kunit_test_suite_end(void) { }
+
+#endif /* CONFIG_KASAN_KUNIT_TEST */
 
 #if IS_ENABLED(CONFIG_KASAN_KUNIT_TEST) || IS_ENABLED(CONFIG_KASAN_MODULE_TEST)
 

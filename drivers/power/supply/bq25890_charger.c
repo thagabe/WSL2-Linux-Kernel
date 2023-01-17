@@ -1161,6 +1161,8 @@ static int bq25890_register_regulator(struct bq25890_device *bq)
 				     "registering vbus regulator");
 	}
 
+	/* pdata->regulator_init_data is for vbus only */
+	cfg.init_data = NULL;
 	reg = devm_regulator_register(bq->dev, &bq25890_vsys_desc, &cfg);
 	if (IS_ERR(reg)) {
 		return dev_err_probe(bq->dev, PTR_ERR(reg),
@@ -1315,8 +1317,14 @@ static int bq25890_fw_probe(struct bq25890_device *bq)
 	return 0;
 }
 
-static int bq25890_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static void bq25890_non_devm_cleanup(void *data)
+{
+	struct bq25890_device *bq = data;
+
+	cancel_delayed_work_sync(&bq->pump_express_work);
+}
+
+static int bq25890_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct bq25890_device *bq;
@@ -1371,7 +1379,26 @@ static int bq25890_probe(struct i2c_client *client,
 	/* OTG reporting */
 	bq->usb_phy = devm_usb_get_phy(dev, USB_PHY_TYPE_USB2);
 
+	/*
+	 * This must be before bq25890_power_supply_init(), so that it runs
+	 * after devm unregisters the power_supply.
+	 */
+	ret = devm_add_action_or_reset(dev, bq25890_non_devm_cleanup, bq);
+	if (ret)
+		return ret;
+
 	ret = bq25890_register_regulator(bq);
+	if (ret)
+		return ret;
+
+	ret = bq25890_power_supply_init(bq);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "registering power supply\n");
+
+	ret = devm_request_threaded_irq(dev, client->irq, NULL,
+					bq25890_irq_handler_thread,
+					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+					BQ25890_IRQ_PIN, bq);
 	if (ret)
 		return ret;
 
@@ -1381,34 +1408,17 @@ static int bq25890_probe(struct i2c_client *client,
 		usb_register_notifier(bq->usb_phy, &bq->usb_nb);
 	}
 
-	ret = bq25890_power_supply_init(bq);
-	if (ret < 0) {
-		dev_err(dev, "Failed to register power supply\n");
-		goto err_unregister_usb_notifier;
-	}
-
-	ret = devm_request_threaded_irq(dev, client->irq, NULL,
-					bq25890_irq_handler_thread,
-					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
-					BQ25890_IRQ_PIN, bq);
-	if (ret)
-		goto err_unregister_usb_notifier;
-
 	return 0;
-
-err_unregister_usb_notifier:
-	if (!IS_ERR_OR_NULL(bq->usb_phy))
-		usb_unregister_notifier(bq->usb_phy, &bq->usb_nb);
-
-	return ret;
 }
 
 static void bq25890_remove(struct i2c_client *client)
 {
 	struct bq25890_device *bq = i2c_get_clientdata(client);
 
-	if (!IS_ERR_OR_NULL(bq->usb_phy))
+	if (!IS_ERR_OR_NULL(bq->usb_phy)) {
 		usb_unregister_notifier(bq->usb_phy, &bq->usb_nb);
+		cancel_work_sync(&bq->usb_work);
+	}
 
 	if (!bq->skip_reset) {
 		/* reset all registers to default values */
@@ -1515,7 +1525,7 @@ static struct i2c_driver bq25890_driver = {
 		.acpi_match_table = ACPI_PTR(bq25890_acpi_match),
 		.pm = &bq25890_pm,
 	},
-	.probe = bq25890_probe,
+	.probe_new = bq25890_probe,
 	.remove = bq25890_remove,
 	.shutdown = bq25890_shutdown,
 	.id_table = bq25890_i2c_ids,

@@ -43,7 +43,7 @@
 #include "ordered-data.h"
 #include "xattr.h"
 #include "tree-log.h"
-#include "volumes.h"
+#include "bio.h"
 #include "compression.h"
 #include "locking.h"
 #include "free-space-cache.h"
@@ -1709,9 +1709,8 @@ static noinline int csum_exist_in_range(struct btrfs_fs_info *fs_info,
 	int ret;
 	LIST_HEAD(list);
 
-	ret = btrfs_lookup_csums_range(csum_root, bytenr,
-				       bytenr + num_bytes - 1, &list, 0,
-				       nowait);
+	ret = btrfs_lookup_csums_list(csum_root, bytenr, bytenr + num_bytes - 1,
+				      &list, 0, nowait);
 	if (ret == 0 && list_empty(&list))
 		return 0;
 
@@ -7093,7 +7092,7 @@ next:
 		 * Other members are not utilized for inline extents.
 		 */
 		ASSERT(em->block_start == EXTENT_MAP_INLINE);
-		ASSERT(em->len = fs_info->sectorsize);
+		ASSERT(em->len == fs_info->sectorsize);
 
 		ret = read_inline_extent(inode, path, page);
 		if (ret < 0)
@@ -9378,8 +9377,10 @@ static int btrfs_rename(struct user_namespace *mnt_userns,
 
 	if (flags & RENAME_WHITEOUT) {
 		whiteout_args.inode = new_whiteout_inode(mnt_userns, old_dir);
-		if (!whiteout_args.inode)
-			return -ENOMEM;
+		if (!whiteout_args.inode) {
+			ret = -ENOMEM;
+			goto out_fscrypt_names;
+		}
 		ret = btrfs_new_inode_prepare(&whiteout_args, &trans_num_items);
 		if (ret)
 			goto out_whiteout_inode;

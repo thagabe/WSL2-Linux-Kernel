@@ -141,8 +141,8 @@ static void kvm_pmu_set_pmc_value(struct kvm_pmc *pmc, u64 val, bool force)
 		 * action is to use PMCR.P, which will reset them to
 		 * 0 (the only use of the 'force' parameter).
 		 */
-		val  = lower_32_bits(val);
-		val |= upper_32_bits(__vcpu_sys_reg(vcpu, reg));
+		val  = __vcpu_sys_reg(vcpu, reg) & GENMASK(63, 32);
+		val |= lower_32_bits(val);
 	}
 
 	__vcpu_sys_reg(vcpu, reg) = val;
@@ -461,14 +461,10 @@ static u64 compute_period(struct kvm_pmc *pmc, u64 counter)
 {
 	u64 val;
 
-	if (kvm_pmc_is_64bit(pmc)) {
-		if (!kvm_pmc_has_64bit_overflow(pmc))
-			val = -(counter & GENMASK(31, 0));
-		else
-			val = (-counter) & GENMASK(63, 0);
-	} else {
+	if (kvm_pmc_is_64bit(pmc) && kvm_pmc_has_64bit_overflow(pmc))
+		val = (-counter) & GENMASK(63, 0);
+	else
 		val = (-counter) & GENMASK(31, 0);
-	}
 
 	return val;
 }
@@ -537,6 +533,12 @@ void kvm_pmu_handle_pmcr(struct kvm_vcpu *vcpu, u64 val)
 
 	if (!kvm_vcpu_has_pmu(vcpu))
 		return;
+
+	/* Fixup PMCR_EL0 to reconcile the PMU version and the LP bit */
+	if (!kvm_pmu_is_3p5(vcpu))
+		val &= ~ARMV8_PMU_PMCR_LP;
+
+	__vcpu_sys_reg(vcpu, PMCR_EL0) = val;
 
 	if (val & ARMV8_PMU_PMCR_E) {
 		kvm_pmu_enable_counter_mask(vcpu,
@@ -668,7 +670,8 @@ void kvm_host_pmu_init(struct arm_pmu *pmu)
 {
 	struct arm_pmu_entry *entry;
 
-	if (pmu->pmuver == 0 || pmu->pmuver == ID_AA64DFR0_EL1_PMUVer_IMP_DEF)
+	if (pmu->pmuver == ID_AA64DFR0_EL1_PMUVer_NI ||
+	    pmu->pmuver == ID_AA64DFR0_EL1_PMUVer_IMP_DEF)
 		return;
 
 	mutex_lock(&arm_pmus_lock);
@@ -721,7 +724,7 @@ static struct arm_pmu *kvm_pmu_probe_armpmu(void)
 
 	if (event->pmu) {
 		pmu = to_arm_pmu(event->pmu);
-		if (pmu->pmuver == 0 ||
+		if (pmu->pmuver == ID_AA64DFR0_EL1_PMUVer_NI ||
 		    pmu->pmuver == ID_AA64DFR0_EL1_PMUVer_IMP_DEF)
 			pmu = NULL;
 	}

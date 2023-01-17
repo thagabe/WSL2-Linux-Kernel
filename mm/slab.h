@@ -217,8 +217,6 @@ struct kmem_cache {
 	unsigned int size;	/* The aligned/padded/added on size  */
 	unsigned int align;	/* Alignment as calculated */
 	slab_flags_t flags;	/* Active flags on the slab */
-	unsigned int useroffset;/* Usercopy region offset */
-	unsigned int usersize;	/* Usercopy region size */
 	const char *name;	/* Slab name for sysfs */
 	int refcount;		/* Use counter */
 	void (*ctor)(void *);	/* Called on object slot creation */
@@ -346,7 +344,8 @@ static inline slab_flags_t kmem_cache_flags(unsigned int object_size,
 			  SLAB_ACCOUNT)
 #elif defined(CONFIG_SLUB)
 #define SLAB_CACHE_FLAGS (SLAB_NOLEAKTRACE | SLAB_RECLAIM_ACCOUNT | \
-			  SLAB_TEMPORARY | SLAB_ACCOUNT | SLAB_NO_USER_FLAGS)
+			  SLAB_TEMPORARY | SLAB_ACCOUNT | \
+			  SLAB_NO_USER_FLAGS | SLAB_KMALLOC)
 #else
 #define SLAB_CACHE_FLAGS (SLAB_NOLEAKTRACE)
 #endif
@@ -366,6 +365,7 @@ static inline slab_flags_t kmem_cache_flags(unsigned int object_size,
 			      SLAB_RECLAIM_ACCOUNT | \
 			      SLAB_TEMPORARY | \
 			      SLAB_ACCOUNT | \
+			      SLAB_KMALLOC | \
 			      SLAB_NO_USER_FLAGS)
 
 bool __kmem_cache_empty(struct kmem_cache *);

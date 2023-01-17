@@ -506,9 +506,6 @@ static void __filemap_fdatawait_range(struct address_space *mapping,
 	struct pagevec pvec;
 	int nr_pages;
 
-	if (end_byte < start_byte)
-		return;
-
 	pagevec_init(&pvec);
 	while (index <= end) {
 		unsigned i;
@@ -670,6 +667,9 @@ int filemap_write_and_wait_range(struct address_space *mapping,
 {
 	int err = 0, err2;
 
+	if (lend < lstart)
+		return 0;
+
 	if (mapping_needs_writeback(mapping)) {
 		err = __filemap_fdatawrite_range(mapping, lstart, lend,
 						 WB_SYNC_ALL);
@@ -770,6 +770,9 @@ int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
 	int err = 0, err2;
 	struct address_space *mapping = file->f_mapping;
 
+	if (lend < lstart)
+		return 0;
+
 	if (mapping_needs_writeback(mapping)) {
 		err = __filemap_fdatawrite_range(mapping, lstart, lend,
 						 WB_SYNC_ALL);
@@ -785,56 +788,54 @@ int file_write_and_wait_range(struct file *file, loff_t lstart, loff_t lend)
 EXPORT_SYMBOL(file_write_and_wait_range);
 
 /**
- * replace_page_cache_page - replace a pagecache page with a new one
- * @old:	page to be replaced
- * @new:	page to replace with
+ * replace_page_cache_folio - replace a pagecache folio with a new one
+ * @old:	folio to be replaced
+ * @new:	folio to replace with
  *
- * This function replaces a page in the pagecache with a new one.  On
- * success it acquires the pagecache reference for the new page and
- * drops it for the old page.  Both the old and new pages must be
- * locked.  This function does not add the new page to the LRU, the
+ * This function replaces a folio in the pagecache with a new one.  On
+ * success it acquires the pagecache reference for the new folio and
+ * drops it for the old folio.  Both the old and new folios must be
+ * locked.  This function does not add the new folio to the LRU, the
  * caller must do that.
  *
  * The remove + add is atomic.  This function cannot fail.
  */
-void replace_page_cache_page(struct page *old, struct page *new)
+void replace_page_cache_folio(struct folio *old, struct folio *new)
 {
-	struct folio *fold = page_folio(old);
-	struct folio *fnew = page_folio(new);
 	struct address_space *mapping = old->mapping;
 	void (*free_folio)(struct folio *) = mapping->a_ops->free_folio;
 	pgoff_t offset = old->index;
 	XA_STATE(xas, &mapping->i_pages, offset);
 
-	VM_BUG_ON_PAGE(!PageLocked(old), old);
-	VM_BUG_ON_PAGE(!PageLocked(new), new);
-	VM_BUG_ON_PAGE(new->mapping, new);
+	VM_BUG_ON_FOLIO(!folio_test_locked(old), old);
+	VM_BUG_ON_FOLIO(!folio_test_locked(new), new);
+	VM_BUG_ON_FOLIO(new->mapping, new);
 
-	get_page(new);
+	folio_get(new);
 	new->mapping = mapping;
 	new->index = offset;
 
-	mem_cgroup_migrate(fold, fnew);
+	mem_cgroup_migrate(old, new);
 
 	xas_lock_irq(&xas);
 	xas_store(&xas, new);
 
 	old->mapping = NULL;
 	/* hugetlb pages do not participate in page cache accounting. */
-	if (!PageHuge(old))
-		__dec_lruvec_page_state(old, NR_FILE_PAGES);
-	if (!PageHuge(new))
-		__inc_lruvec_page_state(new, NR_FILE_PAGES);
-	if (PageSwapBacked(old))
-		__dec_lruvec_page_state(old, NR_SHMEM);
-	if (PageSwapBacked(new))
-		__inc_lruvec_page_state(new, NR_SHMEM);
+	if (!folio_test_hugetlb(old))
+		__lruvec_stat_sub_folio(old, NR_FILE_PAGES);
+	if (!folio_test_hugetlb(new))
+		__lruvec_stat_add_folio(new, NR_FILE_PAGES);
+	if (folio_test_swapbacked(old))
+		__lruvec_stat_sub_folio(old, NR_SHMEM);
+	if (folio_test_swapbacked(new))
+		__lruvec_stat_add_folio(new, NR_SHMEM);
 	xas_unlock_irq(&xas);
 	if (free_folio)
-		free_folio(fold);
-	folio_put(fold);
+		free_folio(old);
+	folio_put(old);
 }
-EXPORT_SYMBOL_GPL(replace_page_cache_page);
+EXPORT_SYMBOL_GPL(replace_page_cache_folio);
 
 noinline int __filemap_add_folio(struct address_space *mapping,
 		struct folio *folio, pgoff_t index, gfp_t gfp, void **shadowp)

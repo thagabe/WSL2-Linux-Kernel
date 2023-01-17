@@ -76,12 +76,6 @@ bool redirty_page_for_writepage(struct writeback_control *wbc,
 }
 EXPORT_SYMBOL(redirty_page_for_writepage);
 
-void lru_cache_add(struct page *page)
-{
-	folio_add_lru(page_folio(page));
-}
-EXPORT_SYMBOL(lru_cache_add);
-
 void lru_cache_add_inactive_or_unevictable(struct page *page,
 		struct vm_area_struct *vma)
 {
@@ -117,12 +111,6 @@ struct page *grab_cache_page_write_begin(struct address_space *mapping,
 			mapping_gfp_mask(mapping));
 }
 EXPORT_SYMBOL(grab_cache_page_write_begin);
-
-int try_to_release_page(struct page *page, gfp_t gfp)
-{
-	return filemap_release_folio(page_folio(page), gfp);
-}
-EXPORT_SYMBOL(try_to_release_page);
 
 int isolate_lru_page(struct page *page)
 {

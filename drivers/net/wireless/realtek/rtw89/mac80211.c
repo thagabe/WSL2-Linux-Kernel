@@ -125,18 +125,21 @@ static int rtw89_ops_add_interface(struct ieee80211_hw *hw,
 						  RTW89_PORT_NUM);
 	if (rtwvif->port == RTW89_PORT_NUM) {
 		ret = -ENOSPC;
+		list_del_init(&rtwvif->list);
 		goto out;
 	}
 
 	rtwvif->bcn_hit_cond = 0;
 	rtwvif->mac_idx = RTW89_MAC_0;
 	rtwvif->phy_idx = RTW89_PHY_0;
+	rtwvif->sub_entity_idx = RTW89_SUB_ENTITY_0;
 	rtwvif->hit_rule = 0;
 	ether_addr_copy(rtwvif->mac_addr, vif->addr);
 
 	ret = rtw89_mac_add_vif(rtwdev, rtwvif);
 	if (ret) {
 		rtw89_core_release_bit_map(rtwdev->hw_port, rtwvif->port);
+		list_del_init(&rtwvif->list);
 		goto out;
 	}
 
@@ -174,6 +177,9 @@ static int rtw89_ops_change_interface(struct ieee80211_hw *hw,
 				      enum nl80211_iftype type, bool p2p)
 {
 	struct rtw89_dev *rtwdev = hw->priv;
+	int ret;
+
+	set_bit(RTW89_FLAG_CHANGING_INTERFACE, rtwdev->flags);
 
 	rtw89_debug(rtwdev, RTW89_DBG_STATE, "change vif %pM (%d)->(%d), p2p (%d)->(%d)\n",
 		    vif->addr, vif->type, type, vif->p2p, p2p);
@@ -183,7 +189,13 @@ static int rtw89_ops_change_interface(struct ieee80211_hw *hw,
 	vif->type = type;
 	vif->p2p = p2p;
 
-	return rtw89_ops_add_interface(hw, vif);
+	ret = rtw89_ops_add_interface(hw, vif);
+	if (ret)
+		rtw89_warn(rtwdev, "failed to change interface %d\n", ret);
+
+	clear_bit(RTW89_FLAG_CHANGING_INTERFACE, rtwdev->flags);
+
+	return ret;
 }
 
 static void rtw89_ops_configure_filter(struct ieee80211_hw *hw,
@@ -444,6 +456,7 @@ void rtw89_ops_stop_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 	struct rtw89_vif *rtwvif = (struct rtw89_vif *)vif->drv_priv;
 
 	mutex_lock(&rtwdev->mutex);
+	rtw89_mac_stop_ap(rtwdev, rtwvif);
 	rtw89_fw_h2c_assoc_cmac_tbl(rtwdev, vif, NULL);
 	rtw89_fw_h2c_join_info(rtwdev, rtwvif, NULL, true);
 	mutex_unlock(&rtwdev->mutex);

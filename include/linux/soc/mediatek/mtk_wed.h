@@ -85,6 +85,9 @@ struct mtk_wed_device {
 	int irq;
 	u8 version;
 
+	/* used by wlan driver */
+	u32 rev_id;
+
 	struct mtk_wed_ring tx_ring[MTK_WED_TX_QUEUES];
 	struct mtk_wed_ring rx_ring[MTK_WED_RX_QUEUES];
 	struct mtk_wed_ring txfree_ring;
@@ -155,9 +158,9 @@ struct mtk_wed_device {
 struct mtk_wed_ops {
 	int (*attach)(struct mtk_wed_device *dev);
 	int (*tx_ring_setup)(struct mtk_wed_device *dev, int ring,
-			     void __iomem *regs);
+			     void __iomem *regs, bool reset);
 	int (*rx_ring_setup)(struct mtk_wed_device *dev, int ring,
-			     void __iomem *regs);
+			     void __iomem *regs, bool reset);
 	int (*txfree_ring_setup)(struct mtk_wed_device *dev,
 				 void __iomem *regs);
 	int (*msg_update)(struct mtk_wed_device *dev, int cmd_id,
@@ -213,8 +216,8 @@ mtk_wed_get_rx_capa(struct mtk_wed_device *dev)
 #define mtk_wed_device_active(_dev) !!(_dev)->ops
 #define mtk_wed_device_detach(_dev) (_dev)->ops->detach(_dev)
 #define mtk_wed_device_start(_dev, _mask) (_dev)->ops->start(_dev, _mask)
-#define mtk_wed_device_tx_ring_setup(_dev, _ring, _regs) \
-	(_dev)->ops->tx_ring_setup(_dev, _ring, _regs)
+#define mtk_wed_device_tx_ring_setup(_dev, _ring, _regs, _reset) \
+	(_dev)->ops->tx_ring_setup(_dev, _ring, _regs, _reset)
 #define mtk_wed_device_txfree_ring_setup(_dev, _regs) \
 	(_dev)->ops->txfree_ring_setup(_dev, _regs)
 #define mtk_wed_device_reg_read(_dev, _reg) \
@@ -225,12 +228,14 @@ mtk_wed_get_rx_capa(struct mtk_wed_device *dev)
 	(_dev)->ops->irq_get(_dev, _mask)
 #define mtk_wed_device_irq_set_mask(_dev, _mask) \
 	(_dev)->ops->irq_set_mask(_dev, _mask)
-#define mtk_wed_device_rx_ring_setup(_dev, _ring, _regs) \
-	(_dev)->ops->rx_ring_setup(_dev, _ring, _regs)
+#define mtk_wed_device_rx_ring_setup(_dev, _ring, _regs, _reset) \
+	(_dev)->ops->rx_ring_setup(_dev, _ring, _regs, _reset)
 #define mtk_wed_device_ppe_check(_dev, _skb, _reason, _hash) \
 	(_dev)->ops->ppe_check(_dev, _skb, _reason, _hash)
 #define mtk_wed_device_update_msg(_dev, _id, _msg, _len) \
 	(_dev)->ops->msg_update(_dev, _id, _msg, _len)
+#define mtk_wed_device_stop(_dev) (_dev)->ops->stop(_dev)
+#define mtk_wed_device_dma_reset(_dev) (_dev)->ops->reset_dma(_dev)
 #else
 static inline bool mtk_wed_device_active(struct mtk_wed_device *dev)
 {
@@ -238,15 +243,17 @@ static inline bool mtk_wed_device_active(struct mtk_wed_device *dev)
 }
 #define mtk_wed_device_detach(_dev) do {} while (0)
 #define mtk_wed_device_start(_dev, _mask) do {} while (0)
-#define mtk_wed_device_tx_ring_setup(_dev, _ring, _regs) -ENODEV
+#define mtk_wed_device_tx_ring_setup(_dev, _ring, _regs, _reset) -ENODEV
 #define mtk_wed_device_txfree_ring_setup(_dev, _ring, _regs) -ENODEV
 #define mtk_wed_device_reg_read(_dev, _reg) 0
 #define mtk_wed_device_reg_write(_dev, _reg, _val) do {} while (0)
 #define mtk_wed_device_irq_get(_dev, _mask) 0
 #define mtk_wed_device_irq_set_mask(_dev, _mask) do {} while (0)
-#define mtk_wed_device_rx_ring_setup(_dev, _ring, _regs) -ENODEV
+#define mtk_wed_device_rx_ring_setup(_dev, _ring, _regs, _reset) -ENODEV
 #define mtk_wed_device_ppe_check(_dev, _skb, _reason, _hash)  do {} while (0)
 #define mtk_wed_device_update_msg(_dev, _id, _msg, _len) -ENODEV
+#define mtk_wed_device_stop(_dev) do {} while (0)
+#define mtk_wed_device_dma_reset(_dev) do {} while (0)
 #endif
 
 #endif

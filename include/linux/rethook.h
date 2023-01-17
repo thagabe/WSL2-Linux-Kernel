@@ -6,7 +6,7 @@
 #define _LINUX_RETHOOK_H
 
 #include <linux/compiler.h>
-#include <linux/objpool.h>
+#include <linux/freelist.h>
 #include <linux/kallsyms.h>
 #include <linux/llist.h>
 #include <linux/rcupdate.h>
@@ -30,14 +30,14 @@ typedef void (*rethook_handler_t) (struct rethook_node *, void *, struct pt_regs
 struct rethook {
 	void			*data;
 	rethook_handler_t	handler;
-	struct objpool_head	pool;
+	struct freelist_head	pool;
 	refcount_t		ref;
 	struct rcu_head		rcu;
 };
 
 /**
  * struct rethook_node - The rethook shadow-stack entry node.
- * @nod: The objpool node, linked to struct rethook::pool.
+ * @freelist: The freelist, linked to struct rethook::pool.
  * @rcu: The rcu_head for deferred freeing.
  * @llist: The llist, linked to a struct task_struct::rethooks.
  * @rethook: The pointer to the struct rethook.
@@ -48,15 +48,19 @@ struct rethook {
  * on each entry of the shadow stack.
  */
 struct rethook_node {
-	struct rcu_head		rcu;
+	union {
+		struct freelist_node freelist;
+		struct rcu_head      rcu;
+	};
 	struct llist_node	llist;
 	struct rethook		*rethook;
 	unsigned long		ret_addr;
 	unsigned long		frame;
 };
 
-struct rethook *rethook_alloc(void *data, rethook_handler_t handler, gfp_t gfp, int size, int max);
+struct rethook *rethook_alloc(void *data, rethook_handler_t handler);
 void rethook_free(struct rethook *rh);
+void rethook_add_node(struct rethook *rh, struct rethook_node *node);
 struct rethook_node *rethook_try_get(struct rethook *rh);
 void rethook_recycle(struct rethook_node *node);
 void rethook_hook(struct rethook_node *node, struct pt_regs *regs, bool mcount);
@@ -93,3 +97,4 @@ void rethook_flush_task(struct task_struct *tk);
 #endif
 
 #endif
+

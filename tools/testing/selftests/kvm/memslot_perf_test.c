@@ -265,6 +265,9 @@ static uint64_t get_max_slots(struct vm_data *data, uint32_t host_page_size)
 	slots = data->nslots;
 	while (--slots > 1) {
 		pages_per_slot = mempages / slots;
+		if (!pages_per_slot)
+			continue;
+
 		rempages = mempages % pages_per_slot;
 		if (check_slot_pages(host_page_size, guest_page_size,
 				     pages_per_slot, rempages))
@@ -289,7 +292,6 @@ static bool prepare_vm(struct vm_data *data, int nslots, uint64_t *maxslots,
 	mempages = mem_size / guest_page_size;
 
 	data->vm = __vm_create_with_one_vcpu(&data->vcpu, mempages, guest_code);
-	ucall_init(data->vm, NULL);
 	TEST_ASSERT(data->vm->page_size == guest_page_size, "Invalid VM page size");
 
 	data->npages = mempages;
@@ -305,6 +307,8 @@ static bool prepare_vm(struct vm_data *data, int nslots, uint64_t *maxslots,
 
 	data->hva_slots = malloc(sizeof(*data->hva_slots) * data->nslots);
 	TEST_ASSERT(data->hva_slots, "malloc() fail");
+
+	data->vm = __vm_create_with_one_vcpu(&data->vcpu, mempages, guest_code);
 
 	pr_info_v("Adding slots 1..%i, each slot with %"PRIu64" pages + %"PRIu64" extra pages last\n",
 		data->nslots, data->pages_per_slot, rempages);
@@ -966,40 +970,28 @@ static bool parse_args(int argc, char *argv[],
 			map_unmap_verify = true;
 			break;
 		case 's':
-			targs->nslots = atoi(optarg);
+			targs->nslots = atoi_paranoid(optarg);
 			if (targs->nslots <= 1 && targs->nslots != -1) {
 				pr_info("Slot count cap must be larger than 1 or -1 for no cap\n");
 				return false;
 			}
 			break;
 		case 'f':
-			targs->tfirst = atoi(optarg);
-			if (targs->tfirst < 0) {
-				pr_info("First test to run has to be non-negative\n");
-				return false;
-			}
+			targs->tfirst = atoi_non_negative("First test", optarg);
 			break;
 		case 'e':
-			targs->tlast = atoi(optarg);
-			if (targs->tlast < 0 || targs->tlast >= NTESTS) {
+			targs->tlast = atoi_non_negative("Last test", optarg);
+			if (targs->tlast >= NTESTS) {
 				pr_info("Last test to run has to be non-negative and less than %zu\n",
 					NTESTS);
 				return false;
 			}
 			break;
 		case 'l':
-			targs->seconds = atoi(optarg);
-			if (targs->seconds < 0) {
-				pr_info("Test length in seconds has to be non-negative\n");
-				return false;
-			}
+			targs->seconds = atoi_non_negative("Test length", optarg);
 			break;
 		case 'r':
-			targs->runs = atoi(optarg);
-			if (targs->runs <= 0) {
-				pr_info("Runs per test has to be positive\n");
-				return false;
-			}
+			targs->runs = atoi_positive("Runs per test", optarg);
 			break;
 		}
 	}
@@ -1102,9 +1094,6 @@ int main(int argc, char *argv[])
 	};
 	struct test_result rbestslottime;
 	int tctr;
-
-	/* Tell stdout not to buffer its content */
-	setbuf(stdout, NULL);
 
 	if (!check_memory_sizes())
 		return -1;

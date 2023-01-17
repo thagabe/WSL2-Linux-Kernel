@@ -96,6 +96,17 @@ extern int mmap_rnd_compat_bits __read_mostly;
 #include <asm/page.h>
 #include <asm/processor.h>
 
+/*
+ * Architectures that support memory tagging (assigning tags to memory regions,
+ * embedding these tags into addresses that point to these memory regions, and
+ * checking that the memory and the pointer tags match on memory accesses)
+ * redefine this macro to strip tags from pointers.
+ * It's defined as noop for architectures that don't support memory tagging.
+ */
+#ifndef untagged_addr
+#define untagged_addr(addr) (addr)
+#endif
+
 #ifndef __pa_symbol
 #define __pa_symbol(x)  __pa(RELOC_HIDE((unsigned long)(x), 0))
 #endif
@@ -828,12 +839,21 @@ static inline int head_compound_mapcount(struct page *head)
 }
 
 /*
- * Sum of mapcounts of sub-pages, does not include compound mapcount.
+ * If a 16GB hugetlb page were mapped by PTEs of all of its 4kB sub-pages,
+ * its subpages_mapcount would be 0x400000: choose the COMPOUND_MAPPED bit
+ * above that range, instead of 2*(PMD_SIZE/PAGE_SIZE).  Hugetlb currently
+ * leaves subpages_mapcount at 0, but avoid surprise if it participates later.
+ */
+#define COMPOUND_MAPPED	0x800000
+#define SUBPAGES_MAPPED	(COMPOUND_MAPPED - 1)
+
+/*
+ * Number of sub-pages mapped by PTE, does not include compound mapcount.
  * Must be called only on head of compound page.
  */
 static inline int head_subpages_mapcount(struct page *head)
 {
-	return atomic_read(subpages_mapcount_ptr(head));
+	return atomic_read(subpages_mapcount_ptr(head)) & SUBPAGES_MAPPED;
 }
 
 /*
@@ -864,23 +884,7 @@ static inline int page_mapcount(struct page *page)
 	return head_compound_mapcount(page) + mapcount;
 }
 
-static inline int total_mapcount(struct page *page)
-{
-	if (likely(!PageCompound(page)))
-		return atomic_read(&page->_mapcount) + 1;
-	page = compound_head(page);
-	return head_compound_mapcount(page) + head_subpages_mapcount(page);
-}
-
-/*
- * Return true if this page is mapped into pagetables.
- * For compound page it returns true if any subpage of compound page is mapped,
- * even if this particular subpage is not itself mapped by any PTE or PMD.
- */
-static inline bool page_mapped(struct page *page)
-{
-	return total_mapcount(page) > 0;
-}
+int total_compound_mapcount(struct page *head);
 
 /**
  * folio_mapcount() - Calculate the number of mappings of this folio.
@@ -897,8 +901,24 @@ static inline int folio_mapcount(struct folio *folio)
 {
 	if (likely(!folio_test_large(folio)))
 		return atomic_read(&folio->_mapcount) + 1;
-	return atomic_read(folio_mapcount_ptr(folio)) + 1 +
-		atomic_read(folio_subpages_mapcount_ptr(folio));
+	return total_compound_mapcount(&folio->page);
+}
+
+static inline int total_mapcount(struct page *page)
+{
+	if (likely(!PageCompound(page)))
+		return atomic_read(&page->_mapcount) + 1;
+	return total_compound_mapcount(compound_head(page));
+}
+
+static inline bool folio_large_is_mapped(struct folio *folio)
+{
+	/*
+	 * Reading folio_mapcount_ptr() below could be omitted if hugetlb
+	 * participated in incrementing subpages_mapcount when compound mapped.
+	 */
+	return atomic_read(folio_subpages_mapcount_ptr(folio)) > 0 ||
+		atomic_read(folio_mapcount_ptr(folio)) >= 0;
 }
 
 /**
@@ -909,7 +929,21 @@ static inline int folio_mapcount(struct folio *folio)
  */
 static inline bool folio_mapped(struct folio *folio)
 {
-	return folio_mapcount(folio) > 0;
+	if (likely(!folio_test_large(folio)))
+		return atomic_read(&folio->_mapcount) >= 0;
+	return folio_large_is_mapped(folio);
+}
+
+/*
+ * Return true if this page is mapped into pagetables.
+ * For compound page it returns true if any sub-page of compound page is mapped,
+ * even if this particular sub-page is not itself mapped by any PTE or PMD.
+ */
+static inline bool page_mapped(struct page *page)
+{
+	if (likely(!PageCompound(page)))
+		return atomic_read(&page->_mapcount) >= 0;
+	return folio_large_is_mapped(page_folio(page));
 }
 
 static inline struct page *virt_to_head_page(const void *x)
@@ -985,9 +1019,16 @@ static inline void set_compound_order(struct page *page, unsigned int order)
 #endif
 }
 
+/*
+ * folio_set_compound_order is generally passed a non-zero order to
+ * initialize a large folio.  However, hugetlb code abuses this by
+ * passing in zero when 'dissolving' a large folio.
+ */
 static inline void folio_set_compound_order(struct folio *folio,
 		unsigned int order)
 {
+	VM_BUG_ON_FOLIO(!folio_test_large(folio), folio);
+
 	folio->_folio_order = order;
 #ifdef CONFIG_64BIT
 	folio->_folio_nr_pages = order ? 1U << order : 0;
@@ -1132,6 +1173,30 @@ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
  *   back into memory.
  */
 
+#if defined(CONFIG_ZONE_DEVICE) && defined(CONFIG_FS_DAX)
+DECLARE_STATIC_KEY_FALSE(devmap_managed_key);
+
+bool __put_devmap_managed_page_refs(struct page *page, int refs);
+static inline bool put_devmap_managed_page_refs(struct page *page, int refs)
+{
+	if (!static_branch_unlikely(&devmap_managed_key))
+		return false;
+	if (!is_zone_device_page(page))
+		return false;
+	return __put_devmap_managed_page_refs(page, refs);
+}
+#else /* CONFIG_ZONE_DEVICE && CONFIG_FS_DAX */
+static inline bool put_devmap_managed_page_refs(struct page *page, int refs)
+{
+	return false;
+}
+#endif /* CONFIG_ZONE_DEVICE && CONFIG_FS_DAX */
+
+static inline bool put_devmap_managed_page(struct page *page)
+{
+	return put_devmap_managed_page_refs(page, 1);
+}
+
 /* 127: arbitrary random number, small enough to assemble well */
 #define folio_ref_zero_or_close_to_overflow(folio) \
 	((unsigned int) folio_ref_count(folio) + 127u <= 127u)
@@ -1245,6 +1310,12 @@ static inline void put_page(struct page *page)
 {
 	struct folio *folio = page_folio(page);
 
+	/*
+	 * For some devmap managed pages we need to catch refcount transition
+	 * from 2 to 1:
+	 */
+	if (put_devmap_managed_page(&folio->page))
+		return;
 	folio_put(folio);
 }
 
@@ -2462,7 +2533,7 @@ static inline void pgtable_pte_page_dtor(struct page *page)
 
 #if USE_SPLIT_PMD_PTLOCKS
 
-static struct page *pmd_to_page(pmd_t *pmd)
+static inline struct page *pmd_pgtable_page(pmd_t *pmd)
 {
 	unsigned long mask = ~(PTRS_PER_PMD * sizeof(pmd_t) - 1);
 	return virt_to_page((void *)((unsigned long) pmd & mask));
@@ -2470,7 +2541,7 @@ static struct page *pmd_to_page(pmd_t *pmd)
 
 static inline spinlock_t *pmd_lockptr(struct mm_struct *mm, pmd_t *pmd)
 {
-	return ptlock_ptr(pmd_to_page(pmd));
+	return ptlock_ptr(pmd_pgtable_page(pmd));
 }
 
 static inline bool pmd_ptlock_init(struct page *page)
@@ -2489,7 +2560,7 @@ static inline void pmd_ptlock_free(struct page *page)
 	ptlock_free(page);
 }
 
-#define pmd_huge_pte(mm, pmd) (pmd_to_page(pmd)->pmd_huge_pte)
+#define pmd_huge_pte(mm, pmd) (pmd_pgtable_page(pmd)->pmd_huge_pte)
 
 #else
 
@@ -3017,6 +3088,7 @@ struct page *follow_page(struct vm_area_struct *vma, unsigned long address,
 #define FOLL_PIN	0x40000	/* pages must be released via unpin_user_page */
 #define FOLL_FAST_ONLY	0x80000	/* gup_fast: prevent fall-back to slow gup */
 #define FOLL_PCI_P2PDMA	0x100000 /* allow returning PCI P2PDMA pages */
+#define FOLL_INTERRUPTIBLE  0x200000 /* allow interrupts from generic signals */
 
 /*
  * FOLL_PIN and FOLL_LONGTERM may be used in various combinations with each
@@ -3313,6 +3385,8 @@ void *sparse_buffer_alloc(unsigned long size);
 struct page * __populate_section_memmap(unsigned long pfn,
 		unsigned long nr_pages, int nid, struct vmem_altmap *altmap,
 		struct dev_pagemap *pgmap);
+void pmd_init(void *addr);
+void pud_init(void *addr);
 pgd_t *vmemmap_pgd_populate(unsigned long addr, int node);
 p4d_t *vmemmap_p4d_populate(pgd_t *pgd, unsigned long addr, int node);
 pud_t *vmemmap_pud_populate(p4d_t *p4d, unsigned long addr, int node);
@@ -3324,7 +3398,13 @@ struct vmem_altmap;
 void *vmemmap_alloc_block_buf(unsigned long size, int node,
 			      struct vmem_altmap *altmap);
 void vmemmap_verify(pte_t *, int, unsigned long, unsigned long);
+void vmemmap_set_pmd(pmd_t *pmd, void *p, int node,
+		     unsigned long addr, unsigned long next);
+int vmemmap_check_pmd(pmd_t *pmd, int node,
+		      unsigned long addr, unsigned long next);
 int vmemmap_populate_basepages(unsigned long start, unsigned long end,
+			       int node, struct vmem_altmap *altmap);
+int vmemmap_populate_hugepages(unsigned long start, unsigned long end,
 			       int node, struct vmem_altmap *altmap);
 int vmemmap_populate(unsigned long start, unsigned long end, int node,
 		struct vmem_altmap *altmap);

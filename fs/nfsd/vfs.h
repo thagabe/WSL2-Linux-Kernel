@@ -170,14 +170,9 @@ static inline void fh_drop_write(struct svc_fh *fh)
 
 static inline __be32 fh_getattr(const struct svc_fh *fh, struct kstat *stat)
 {
-	u32 request_mask = STATX_BASIC_STATS;
 	struct path p = {.mnt = fh->fh_export->ex_path.mnt,
 			 .dentry = fh->fh_dentry};
-
-	if (fh->fh_maxsize == NFS4_FHSIZE)
-		request_mask |= (STATX_BTIME | STATX_CHANGE_COOKIE);
-
-	return nfserrno(vfs_getattr(&p, stat, request_mask,
+	return nfserrno(vfs_getattr(&p, stat, STATX_BASIC_STATS,
 				    AT_STATX_SYNC_AS_STAT));
 }
 

@@ -482,12 +482,13 @@ int fwnode_property_match_string(const struct fwnode_handle *fwnode,
 
 	ret = fwnode_property_read_string_array(fwnode, propname, values, nval);
 	if (ret < 0)
-		goto out;
+		goto out_free;
 
 	ret = match_string(values, nval, string);
 	if (ret < 0)
 		ret = -ENODATA;
-out:
+
+out_free:
 	kfree(values);
 	return ret;
 }
@@ -608,7 +609,7 @@ EXPORT_SYMBOL_GPL(fwnode_get_parent);
  * node's parents.
  *
  * Returns a node pointer with refcount incremented, use
- * fwnode_handle_node() on it when done.
+ * fwnode_handle_put() on it when done.
  */
 struct fwnode_handle *fwnode_get_next_parent(struct fwnode_handle *fwnode)
 {

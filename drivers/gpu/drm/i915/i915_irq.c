@@ -1085,8 +1085,9 @@ static void ivb_parity_work(struct work_struct *work)
 		kobject_uevent_env(&dev_priv->drm.primary->kdev->kobj,
 				   KOBJ_CHANGE, parity_event);
 
-		DRM_DEBUG("Parity error: Slice = %d, Row = %d, Bank = %d, Sub bank = %d.\n",
-			  slice, row, bank, subbank);
+		drm_dbg(&dev_priv->drm,
+			"Parity error: Slice = %d, Row = %d, Bank = %d, Sub bank = %d.\n",
+			slice, row, bank, subbank);
 
 		kfree(parity_event[4]);
 		kfree(parity_event[3]);
@@ -1973,7 +1974,10 @@ static void icp_irq_handler(struct drm_i915_private *dev_priv, u32 pch_iir)
 	if (ddi_hotplug_trigger) {
 		u32 dig_hotplug_reg;
 
+		/* Locking due to DSI native GPIO sequences */
+		spin_lock(&dev_priv->irq_lock);
 		dig_hotplug_reg = intel_uncore_rmw(&dev_priv->uncore, SHOTPLUG_CTL_DDI, 0, 0);
+		spin_unlock(&dev_priv->irq_lock);
 
 		intel_get_hpd_pins(dev_priv, &pin_mask, &long_mask,
 				   ddi_hotplug_trigger, dig_hotplug_reg,
@@ -2773,7 +2777,8 @@ static irqreturn_t dg1_irq_handler(int irq, void *arg)
 		master_ctl = raw_reg_read(regs, GEN11_GFX_MSTR_IRQ);
 		raw_reg_write(regs, GEN11_GFX_MSTR_IRQ, master_ctl);
 	} else {
-		DRM_ERROR("Tile not supported: 0x%08x\n", master_tile_ctl);
+		drm_err(&i915->drm, "Tile not supported: 0x%08x\n",
+			master_tile_ctl);
 		dg1_master_intr_enable(regs);
 		return IRQ_NONE;
 	}
@@ -3939,7 +3944,7 @@ static void i8xx_error_irq_ack(struct drm_i915_private *i915,
 static void i8xx_error_irq_handler(struct drm_i915_private *dev_priv,
 				   u16 eir, u16 eir_stuck)
 {
-	DRM_DEBUG("Master Error: EIR 0x%04x\n", eir);
+	drm_dbg(&dev_priv->drm, "Master Error: EIR 0x%04x\n", eir);
 
 	if (eir_stuck)
 		drm_dbg(&dev_priv->drm, "EIR stuck: 0x%04x, masked\n",
@@ -3974,7 +3979,7 @@ static void i9xx_error_irq_ack(struct drm_i915_private *dev_priv,
 static void i9xx_error_irq_handler(struct drm_i915_private *dev_priv,
 				   u32 eir, u32 eir_stuck)
 {
-	DRM_DEBUG("Master Error, EIR 0x%08x\n", eir);
+	drm_dbg(&dev_priv->drm, "Master Error, EIR 0x%08x\n", eir);
 
 	if (eir_stuck)
 		drm_dbg(&dev_priv->drm, "EIR stuck: 0x%08x, masked\n",

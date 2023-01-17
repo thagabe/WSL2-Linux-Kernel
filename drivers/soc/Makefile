@@ -21,7 +21,6 @@ obj-$(CONFIG_LITEX_SOC_CONTROLLER) += litex/
 obj-y				+= loongson/
 obj-y				+= mediatek/
 obj-y				+= microchip/
-obj-y				+= nuvoton/
 obj-y				+= pxa/
 obj-y				+= amlogic/
 obj-y				+= qcom/

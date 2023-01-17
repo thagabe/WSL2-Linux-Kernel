@@ -24,6 +24,7 @@ config LINEAR_RANGES
 
 config PACKING
 	bool "Generic bitfield packing and unpacking"
+	select BITREVERSE
 	default n
 	help
 	  This option provides the packing() helper function, which permits
@@ -674,6 +675,9 @@ config ARCH_HAS_PMEM_API
 	bool
 
 config MEMREGION
+	bool
+
+config ARCH_HAS_CPU_CACHE_INVALIDATE_MEMREGION
 	bool
 
 config ARCH_HAS_MEMREMAP_COMPAT_ALIGN

@@ -389,21 +389,6 @@ static u32 p2p_listen_state_process(struct adapter *padapter, unsigned char *da)
 	return _SUCCESS;
 }
 
-static void update_TSF(struct mlme_ext_priv *pmlmeext, u8 *pframe)
-{
-	u8 *pIE;
-	__le32 *pbuf;
-
-	pIE = pframe + sizeof(struct ieee80211_hdr_3addr);
-	pbuf = (__le32 *)pIE;
-
-	pmlmeext->TSFValue = le32_to_cpu(*(pbuf + 1));
-
-	pmlmeext->TSFValue = pmlmeext->TSFValue << 32;
-
-	pmlmeext->TSFValue |= le32_to_cpu(*pbuf);
-}
-
 static void correct_TSF(struct adapter *padapter)
 {
 	u8 reg;
@@ -560,6 +545,7 @@ static void OnProbeRsp(struct adapter *padapter, struct recv_frame *precv_frame)
 
 static void OnBeacon(struct adapter *padapter, struct recv_frame *precv_frame)
 {
+	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)precv_frame->rx_data;
 	int cam_idx;
 	struct sta_info	*psta;
 	struct mlme_ext_priv	*pmlmeext = &padapter->mlmeextpriv;
@@ -569,77 +555,81 @@ static void OnBeacon(struct adapter *padapter, struct recv_frame *precv_frame)
 	u8 *pframe = precv_frame->rx_data;
 	uint len = precv_frame->len;
 	struct wlan_bssid_ex *pbss;
-	int ret = _SUCCESS;
+	u8 *ie_ptr;
+	u32 ie_len;
+
+	ie_ptr = (u8 *)&mgmt->u.beacon.variable;
+	if (precv_frame->len < offsetof(struct ieee80211_mgmt, u.beacon.variable))
+		return;
+	ie_len = precv_frame->len - offsetof(struct ieee80211_mgmt, u.beacon.variable);
 
 	if (pmlmeext->sitesurvey_res.state == SCAN_PROCESS) {
 		report_survey_event(padapter, precv_frame);
 		return;
 	}
 
-	if (!memcmp(GetAddr3Ptr(pframe), get_my_bssid(&pmlmeinfo->network), ETH_ALEN)) {
-		if (pmlmeinfo->state & WIFI_FW_AUTH_NULL) {
-			/* we should update current network before auth, or some IE is wrong */
-			pbss = kmalloc(sizeof(struct wlan_bssid_ex), GFP_ATOMIC);
-			if (pbss) {
-				if (collect_bss_info(padapter, precv_frame, pbss) == _SUCCESS) {
-					update_network(&pmlmepriv->cur_network.network, pbss, padapter, true);
-					rtw_get_bcn_info(&pmlmepriv->cur_network);
-				}
-				kfree(pbss);
-			}
+	if (memcmp(mgmt->bssid, get_my_bssid(&pmlmeinfo->network), ETH_ALEN))
+		return;
 
-			/* check the vendor of the assoc AP */
-			pmlmeinfo->assoc_AP_vendor = check_assoc_AP(pframe + sizeof(struct ieee80211_hdr_3addr), len - sizeof(struct ieee80211_hdr_3addr));
+	if (pmlmeinfo->state & WIFI_FW_AUTH_NULL) {
+		/* we should update current network before auth, or some IE is wrong */
+		pbss = kmalloc(sizeof(struct wlan_bssid_ex), GFP_ATOMIC);
+		if (!pbss)
+			return;
 
-			/* update TSF Value */
-			update_TSF(pmlmeext, pframe);
+		if (collect_bss_info(padapter, precv_frame, pbss) == _SUCCESS) {
+			update_network(&pmlmepriv->cur_network.network, pbss, padapter, true);
+			rtw_get_bcn_info(&pmlmepriv->cur_network);
+		}
+		kfree(pbss);
 
-			/* start auth */
-			start_clnt_auth(padapter);
+		/* check the vendor of the assoc AP */
+		pmlmeinfo->assoc_AP_vendor = check_assoc_AP(pframe + sizeof(struct ieee80211_hdr_3addr), len - sizeof(struct ieee80211_hdr_3addr));
 
+		pmlmeext->TSFValue = le64_to_cpu(mgmt->u.beacon.timestamp);
+
+		/* start auth */
+		start_clnt_auth(padapter);
+
+		return;
+	}
+
+	if (((pmlmeinfo->state & 0x03) == WIFI_FW_STATION_STATE) && (pmlmeinfo->state & WIFI_FW_ASSOC_SUCCESS)) {
+		psta = rtw_get_stainfo(pstapriv, mgmt->sa);
+		if (!psta)
+			return;
+
+		if (rtw_check_bcn_info(padapter, pframe, len) != _SUCCESS) {
+			receive_disconnect(padapter, pmlmeinfo->network.MacAddress, 0);
 			return;
 		}
+		/* update WMM, ERP in the beacon */
+		/* todo: the timer is used instead of the number of the beacon received */
+		if ((sta_rx_pkts(psta) & 0xf) == 0)
+			update_beacon_info(padapter, ie_ptr, ie_len, psta);
+		process_p2p_ps_ie(padapter, ie_ptr, ie_len);
+	} else if ((pmlmeinfo->state & 0x03) == WIFI_FW_ADHOC_STATE) {
+		psta = rtw_get_stainfo(pstapriv, mgmt->sa);
+		if (psta) {
+			/* update WMM, ERP in the beacon */
+			/* todo: the timer is used instead of the number of the beacon received */
+			if ((sta_rx_pkts(psta) & 0xf) == 0)
+				update_beacon_info(padapter, ie_ptr, ie_len, psta);
+		} else {
+			/* allocate a new CAM entry for IBSS station */
+			cam_idx = allocate_fw_sta_entry(padapter);
+			if (cam_idx == NUM_STA)
+				return;
 
-		if (((pmlmeinfo->state & 0x03) == WIFI_FW_STATION_STATE) && (pmlmeinfo->state & WIFI_FW_ASSOC_SUCCESS)) {
-			psta = rtw_get_stainfo(pstapriv, GetAddr2Ptr(pframe));
-			if (psta) {
-				ret = rtw_check_bcn_info(padapter, pframe, len);
-				if (!ret) {
-					receive_disconnect(padapter,
-							   pmlmeinfo->network.MacAddress, 0);
-					return;
-				}
-				/* update WMM, ERP in the beacon */
-				/* todo: the timer is used instead of the number of the beacon received */
-				if ((sta_rx_pkts(psta) & 0xf) == 0)
-					update_beacon_info(padapter, pframe, len, psta);
-				process_p2p_ps_ie(padapter, (pframe + WLAN_HDR_A3_LEN), (len - WLAN_HDR_A3_LEN));
+			/* get supported rate */
+			if (update_sta_support_rate(padapter, ie_ptr, ie_len, cam_idx) == _FAIL) {
+				pmlmeinfo->FW_sta_info[cam_idx].status = 0;
+				return;
 			}
-		} else if ((pmlmeinfo->state & 0x03) == WIFI_FW_ADHOC_STATE) {
-			psta = rtw_get_stainfo(pstapriv, GetAddr2Ptr(pframe));
-			if (psta) {
-				/* update WMM, ERP in the beacon */
-				/* todo: the timer is used instead of the number of the beacon received */
-				if ((sta_rx_pkts(psta) & 0xf) == 0)
-					update_beacon_info(padapter, pframe, len, psta);
-			} else {
-				/* allocate a new CAM entry for IBSS station */
-				cam_idx = allocate_fw_sta_entry(padapter);
-				if (cam_idx == NUM_STA)
-					return;
 
-				/* get supported rate */
-				if (update_sta_support_rate(padapter, (pframe + WLAN_HDR_A3_LEN + _BEACON_IE_OFFSET_), (len - WLAN_HDR_A3_LEN - _BEACON_IE_OFFSET_), cam_idx) == _FAIL) {
-					pmlmeinfo->FW_sta_info[cam_idx].status = 0;
-					return;
-				}
+			pmlmeext->TSFValue = le64_to_cpu(mgmt->u.beacon.timestamp);
 
-				/* update TSF Value */
-				update_TSF(pmlmeext, pframe);
-
-				/* report sta add event */
-				report_add_sta_event(padapter, GetAddr2Ptr(pframe), cam_idx);
-			}
+			report_add_sta_event(padapter, mgmt->sa, cam_idx);
 		}
 	}
 }
@@ -809,7 +799,7 @@ static void OnAuthClient(struct adapter *padapter, struct recv_frame *precv_fram
 	if (!(pmlmeinfo->state & WIFI_FW_AUTH_STATE))
 		return;
 
-	offset = (GetPrivacy(pframe)) ? 4 : 0;
+	offset = ieee80211_has_protected(hdr->frame_control) ? 4 : 0;
 
 	seq	= le16_to_cpu(*(__le16 *)((size_t)pframe + WLAN_HDR_A3_LEN + offset + 2));
 	status	= le16_to_cpu(*(__le16 *)((size_t)pframe + WLAN_HDR_A3_LEN + offset + 4));
@@ -1437,15 +1427,17 @@ static void OnDeAuth(struct adapter *padapter, struct recv_frame *precv_frame)
 
 static void OnDisassoc(struct adapter *padapter, struct recv_frame *precv_frame)
 {
+	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)precv_frame->rx_data;
 	u16 reason;
 	struct mlme_priv *pmlmepriv = &padapter->mlmepriv;
 	struct mlme_ext_priv	*pmlmeext = &padapter->mlmeextpriv;
 	struct mlme_ext_info	*pmlmeinfo = &pmlmeext->mlmext_info;
-	u8 *pframe = precv_frame->rx_data;
 	struct wifidirect_info *pwdinfo = &padapter->wdinfo;
+	struct sta_info *psta;
+	struct sta_priv *pstapriv = &padapter->stapriv;
+	u8 updated = 0;
 
-	/* check A3 */
-	if (!(!memcmp(GetAddr3Ptr(pframe), get_my_bssid(&pmlmeinfo->network), ETH_ALEN)))
+	if (memcmp(mgmt->bssid, get_my_bssid(&pmlmeinfo->network), ETH_ALEN))
 		return;
 
 	if (pwdinfo->rx_invitereq_info.scan_op_ch_only) {
@@ -1453,32 +1445,27 @@ static void OnDisassoc(struct adapter *padapter, struct recv_frame *precv_frame)
 		_set_timer(&pwdinfo->reset_ch_sitesurvey, 10);
 	}
 
-	reason = le16_to_cpu(*(__le16 *)(pframe + WLAN_HDR_A3_LEN));
+	reason = le16_to_cpu(mgmt->u.disassoc.reason_code);
 
-	if (check_fwstate(pmlmepriv, WIFI_AP_STATE)) {
-		struct sta_info *psta;
-		struct sta_priv *pstapriv = &padapter->stapriv;
-
-		psta = rtw_get_stainfo(pstapriv, GetAddr2Ptr(pframe));
-		if (psta) {
-			u8 updated = 0;
-
-			spin_lock_bh(&pstapriv->asoc_list_lock);
-			if (!list_empty(&psta->asoc_list)) {
-				list_del_init(&psta->asoc_list);
-				pstapriv->asoc_list_cnt--;
-				updated = ap_free_sta(padapter, psta, false, reason);
-			}
-			spin_unlock_bh(&pstapriv->asoc_list_lock);
-
-			associated_clients_update(padapter, updated);
-		}
-
+	if (!check_fwstate(pmlmepriv, WIFI_AP_STATE)) {
+		receive_disconnect(padapter, mgmt->bssid, reason);
+		pmlmepriv->LinkDetectInfo.bBusyTraffic = false;
 		return;
-	} else {
-		receive_disconnect(padapter, GetAddr3Ptr(pframe), reason);
 	}
-	pmlmepriv->LinkDetectInfo.bBusyTraffic = false;
+
+	psta = rtw_get_stainfo(pstapriv, mgmt->sa);
+	if (!psta)
+		return;
+
+	spin_lock_bh(&pstapriv->asoc_list_lock);
+	if (!list_empty(&psta->asoc_list)) {
+		list_del_init(&psta->asoc_list);
+		pstapriv->asoc_list_cnt--;
+		updated = ap_free_sta(padapter, psta, false, reason);
+	}
+	spin_unlock_bh(&pstapriv->asoc_list_lock);
+
+	associated_clients_update(padapter, updated);
 }
 
 static void OnAction_back(struct adapter *padapter, struct recv_frame *precv_frame)
@@ -3196,9 +3183,8 @@ void issue_probersp_p2p(struct adapter *padapter, unsigned char *da)
 	dump_mgntframe(padapter, pmgntframe);
 }
 
-static int _issue_probereq_p2p(struct adapter *padapter, u8 *da)
+inline void issue_probereq_p2p(struct adapter *padapter)
 {
-	int ret = _FAIL;
 	struct xmit_frame		*pmgntframe;
 	struct pkt_attrib		*pattrib;
 	unsigned char			*pframe;
@@ -3214,7 +3200,7 @@ static int _issue_probereq_p2p(struct adapter *padapter, u8 *da)
 
 	pmgntframe = alloc_mgtxmitframe(pxmitpriv);
 	if (!pmgntframe)
-		goto exit;
+		return;
 
 	/* update attribute */
 	pattrib = &pmgntframe->attrib;
@@ -3230,20 +3216,16 @@ static int _issue_probereq_p2p(struct adapter *padapter, u8 *da)
 	fctrl = &pwlanhdr->frame_control;
 	*(fctrl) = 0;
 
-	if (da) {
-		memcpy(pwlanhdr->addr1, da, ETH_ALEN);
-		memcpy(pwlanhdr->addr3, da, ETH_ALEN);
+	if ((pwdinfo->p2p_info.scan_op_ch_only) || (pwdinfo->rx_invitereq_info.scan_op_ch_only)) {
+		/*	This two flags will be set when this is only the P2P client mode. */
+		memcpy(pwlanhdr->addr1, pwdinfo->p2p_peer_interface_addr, ETH_ALEN);
+		memcpy(pwlanhdr->addr3, pwdinfo->p2p_peer_interface_addr, ETH_ALEN);
 	} else {
-		if ((pwdinfo->p2p_info.scan_op_ch_only) || (pwdinfo->rx_invitereq_info.scan_op_ch_only)) {
-			/*	This two flags will be set when this is only the P2P client mode. */
-			memcpy(pwlanhdr->addr1, pwdinfo->p2p_peer_interface_addr, ETH_ALEN);
-			memcpy(pwlanhdr->addr3, pwdinfo->p2p_peer_interface_addr, ETH_ALEN);
-		} else {
-			/*	broadcast probe request frame */
-			eth_broadcast_addr(pwlanhdr->addr1);
-			eth_broadcast_addr(pwlanhdr->addr3);
-		}
+		/*	broadcast probe request frame */
+		eth_broadcast_addr(pwlanhdr->addr1);
+		eth_broadcast_addr(pwlanhdr->addr3);
 	}
+
 	memcpy(pwlanhdr->addr2, mac, ETH_ALEN);
 
 	SetSeqNum(pwlanhdr, pmlmeext->mgnt_seq);
@@ -3470,15 +3452,6 @@ static int _issue_probereq_p2p(struct adapter *padapter, u8 *da)
 	pattrib->last_txcmdsz = pattrib->pktlen;
 
 	dump_mgntframe(padapter, pmgntframe);
-	ret = _SUCCESS;
-
-exit:
-	return ret;
-}
-
-inline void issue_probereq_p2p(struct adapter *adapter, u8 *da)
-{
-	_issue_probereq_p2p(adapter, da);
 }
 
 static s32 rtw_action_public_decache(struct recv_frame *recv_frame, u8 token)
@@ -4482,28 +4455,16 @@ inline void issue_probereq(struct adapter *padapter, struct ndis_802_11_ssid *ps
 	_issue_probereq(padapter, pssid, da, false);
 }
 
-int issue_probereq_ex(struct adapter *padapter, struct ndis_802_11_ssid *pssid, u8 *da,
-	int try_cnt, int wait_ms)
+void issue_probereq_ex(struct adapter *padapter, struct ndis_802_11_ssid *pssid, u8 *da)
 {
-	int ret;
-	int i = 0;
+	int i;
 
-	do {
-		ret = _issue_probereq(padapter, pssid, da, wait_ms > 0);
-
-		i++;
-
-		if (i < try_cnt && wait_ms > 0 && ret == _FAIL)
-			msleep(wait_ms);
-
-	} while ((i < try_cnt) && ((ret == _FAIL) || (wait_ms == 0)));
-
-	if (ret != _FAIL) {
-		ret = _SUCCESS;
-		goto exit;
+	for (i = 0; i < 3; i++) {
+		if (_issue_probereq(padapter, pssid, da, true) == _FAIL)
+			msleep(1);
+		else
+			break;
 	}
-exit:
-	return ret;
 }
 
 /*  if psta == NULL, indicate we are station (client) now... */
@@ -5831,7 +5792,7 @@ void rtw_mlme_site_survey_done(struct adapter *adapter)
 	int res;
 	u8 reg;
 
-	if ((is_client_associated_to_ap(adapter)) ||
+	if ((r8188eu_is_client_associated_to_ap(adapter)) ||
 	    ((pmlmeinfo->state & 0x03) == WIFI_FW_ADHOC_STATE)) {
 		/* enable to rx data frame */
 		rtw_write16(adapter, REG_RXFLTMAP2, 0xFFFF);
@@ -5902,9 +5863,9 @@ void site_survey(struct adapter *padapter)
 		if (ScanType == SCAN_ACTIVE) { /* obey the channel plan setting... */
 			if (rtw_p2p_chk_state(pwdinfo, P2P_STATE_SCAN) ||
 			    rtw_p2p_chk_state(pwdinfo, P2P_STATE_FIND_PHASE_SEARCH)) {
-				issue_probereq_p2p(padapter, NULL);
-				issue_probereq_p2p(padapter, NULL);
-				issue_probereq_p2p(padapter, NULL);
+				issue_probereq_p2p(padapter);
+				issue_probereq_p2p(padapter);
+				issue_probereq_p2p(padapter);
 			} else {
 				int i;
 				for (i = 0; i < RTW_SSID_SCAN_AMOUNT; i++) {
@@ -5982,7 +5943,7 @@ void site_survey(struct adapter *padapter)
 			Restore_DM_Func_Flag(padapter);
 			/* Switch_DM_Func(padapter, DYNAMIC_ALL_FUNC_ENABLE, true); */
 
-			if (is_client_associated_to_ap(padapter))
+			if (r8188eu_is_client_associated_to_ap(padapter))
 				issue_nulldata(padapter, NULL, 0, 3, 500);
 
 			rtw_mlme_site_survey_done(padapter);
@@ -6002,10 +5963,11 @@ void site_survey(struct adapter *padapter)
 /* collect bss info from Beacon and Probe request/response frames. */
 u8 collect_bss_info(struct adapter *padapter, struct recv_frame *precv_frame, struct wlan_bssid_ex *bssid)
 {
+	struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *)precv_frame->rx_data;
 	int	i;
 	u32	len;
 	u8 *p;
-	u16 val16, subtype;
+	u16 val16;
 	u8 *pframe = precv_frame->rx_data;
 	u32	packet_len = precv_frame->len;
 	u8 ie_offset;
@@ -6021,23 +5983,18 @@ u8 collect_bss_info(struct adapter *padapter, struct recv_frame *precv_frame, st
 
 	memset(bssid, 0, sizeof(struct wlan_bssid_ex));
 
-	subtype = GetFrameSubType(pframe);
-
-	if (subtype == WIFI_BEACON) {
+	if (ieee80211_is_beacon(mgmt->frame_control)) {
 		bssid->Reserved[0] = 1;
 		ie_offset = _BEACON_IE_OFFSET_;
+	} else if (ieee80211_is_probe_req(mgmt->frame_control)) {
+		ie_offset = _PROBEREQ_IE_OFFSET_;
+		bssid->Reserved[0] = 2;
+	} else if (ieee80211_is_probe_resp(mgmt->frame_control)) {
+		ie_offset = _PROBERSP_IE_OFFSET_;
+		bssid->Reserved[0] = 3;
 	} else {
-		/*  FIXME : more type */
-		if (subtype == WIFI_PROBEREQ) {
-			ie_offset = _PROBEREQ_IE_OFFSET_;
-			bssid->Reserved[0] = 2;
-		} else if (subtype == WIFI_PROBERSP) {
-			ie_offset = _PROBERSP_IE_OFFSET_;
-			bssid->Reserved[0] = 3;
-		} else {
-			bssid->Reserved[0] = 0;
-			ie_offset = _FIXED_IE_LENGTH_;
-		}
+		bssid->Reserved[0] = 0;
+		ie_offset = _FIXED_IE_LENGTH_;
 	}
 
 	bssid->Length = sizeof(struct wlan_bssid_ex) - MAX_IE_SZ + len;
@@ -6952,7 +6909,7 @@ void mlmeext_sta_del_event_callback(struct adapter *padapter)
 	struct mlme_ext_priv	*pmlmeext = &padapter->mlmeextpriv;
 	struct mlme_ext_info	*pmlmeinfo = &pmlmeext->mlmext_info;
 
-	if (is_client_associated_to_ap(padapter) || is_IBSS_empty(padapter)) {
+	if (r8188eu_is_client_associated_to_ap(padapter) || r8188eu_is_ibss_empty(padapter)) {
 		mlme_disconnect(padapter);
 		rtw_set_bssid(padapter, null_addr);
 
@@ -7025,7 +6982,7 @@ void linked_status_chk(struct adapter *padapter)
 
 	rtl8188e_sreset_linked_status_check(padapter);
 
-	if (is_client_associated_to_ap(padapter)) {
+	if (r8188eu_is_client_associated_to_ap(padapter)) {
 		/* linked infrastructure client mode */
 
 		int tx_chk = _SUCCESS, rx_chk = _SUCCESS;
@@ -7053,7 +7010,7 @@ void linked_status_chk(struct adapter *padapter)
 				}
 
 				if (rx_chk != _SUCCESS)
-					issue_probereq_ex(padapter, &pmlmeinfo->network.Ssid, psta->hwaddr, 3, 1);
+					issue_probereq_ex(padapter, &pmlmeinfo->network.Ssid, psta->hwaddr);
 
 				if ((tx_chk != _SUCCESS && pmlmeinfo->link_count++ == 0xf) || rx_chk != _SUCCESS) {
 					tx_chk = issue_nulldata(padapter, psta->hwaddr, 0, 3, 1);
@@ -7097,7 +7054,7 @@ void linked_status_chk(struct adapter *padapter)
 				pmlmeinfo->link_count = 0;
 			}
 		} /* end of if ((psta = rtw_get_stainfo(pstapriv, passoc_res->network.MacAddress)) != NULL) */
-	} else if (is_client_associated_to_ibss(padapter)) {
+	} else if (r8188eu_is_client_associated_to_ibss(padapter)) {
 		/* linked IBSS mode */
 		/* for each assoc list entry to check the rx pkt counter */
 		for (i = IBSS_START_MAC_ID; i < NUM_STA; i++) {
@@ -7415,7 +7372,7 @@ u8 disconnect_hdl(struct adapter *padapter, unsigned char *pbuf)
 	u8 val8;
 	int res;
 
-	if (is_client_associated_to_ap(padapter))
+	if (r8188eu_is_client_associated_to_ap(padapter))
 		issue_deauth_ex(padapter, pnetwork->MacAddress, WLAN_REASON_DEAUTH_LEAVING, param->deauth_timeout_ms / 100, 100);
 
 	mlme_disconnect(padapter);
@@ -7527,7 +7484,7 @@ u8 sitesurvey_cmd_hdl(struct adapter *padapter, u8 *pbuf)
 		pmlmeext->sitesurvey_res.scan_mode = pparm->scan_mode;
 
 		/* issue null data if associating to the AP */
-		if (is_client_associated_to_ap(padapter)) {
+		if (r8188eu_is_client_associated_to_ap(padapter)) {
 			pmlmeext->sitesurvey_res.state = SCAN_TXNULL;
 
 			issue_nulldata(padapter, NULL, 1, 3, 500);

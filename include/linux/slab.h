@@ -140,7 +140,11 @@
 
 /* The following flags affect the page allocator grouping pages by mobility */
 /* Objects are reclaimable */
+#ifndef CONFIG_SLUB_TINY
 #define SLAB_RECLAIM_ACCOUNT	((slab_flags_t __force)0x00020000U)
+#else
+#define SLAB_RECLAIM_ACCOUNT	((slab_flags_t __force)0)
+#endif
 #define SLAB_TEMPORARY		SLAB_RECLAIM_ACCOUNT	/* Objects are short-lived */
 
 /*
@@ -347,12 +351,17 @@ enum kmalloc_cache_type {
 #endif
 #ifndef CONFIG_MEMCG_KMEM
 	KMALLOC_CGROUP = KMALLOC_NORMAL,
-#else
-	KMALLOC_CGROUP,
 #endif
+#ifdef CONFIG_SLUB_TINY
+	KMALLOC_RECLAIM = KMALLOC_NORMAL,
+#else
 	KMALLOC_RECLAIM,
+#endif
 #ifdef CONFIG_ZONE_DMA
 	KMALLOC_DMA,
+#endif
+#ifdef CONFIG_MEMCG_KMEM
+	KMALLOC_CGROUP,
 #endif
 	NR_KMALLOC_TYPES
 };
@@ -558,42 +567,42 @@ void *kmalloc_large_node(size_t size, gfp_t flags, int node) __assume_page_align
  *	Try really hard to succeed the allocation but fail
  *	eventually.
  */
+#ifndef CONFIG_SLOB
 static __always_inline __alloc_size(1) void *kmalloc(size_t size, gfp_t flags)
 {
-	if (__builtin_constant_p(size)) {
-#ifndef CONFIG_SLOB
+	if (__builtin_constant_p(size) && size) {
 		unsigned int index;
-#endif
+
 		if (size > KMALLOC_MAX_CACHE_SIZE)
 			return kmalloc_large(size, flags);
-#ifndef CONFIG_SLOB
+
 		index = kmalloc_index(size);
-
-		if (!index)
-			return ZERO_SIZE_PTR;
-
 		return kmalloc_trace(
 				kmalloc_caches[kmalloc_type(flags)][index],
 				flags, size);
-#endif
 	}
 	return __kmalloc(size, flags);
 }
+#else
+static __always_inline __alloc_size(1) void *kmalloc(size_t size, gfp_t flags)
+{
+	if (__builtin_constant_p(size) && size > KMALLOC_MAX_CACHE_SIZE)
+		return kmalloc_large(size, flags);
+
+	return __kmalloc(size, flags);
+}
+#endif
 
 #ifndef CONFIG_SLOB
 static __always_inline __alloc_size(1) void *kmalloc_node(size_t size, gfp_t flags, int node)
 {
-	if (__builtin_constant_p(size)) {
+	if (__builtin_constant_p(size) && size) {
 		unsigned int index;
 
 		if (size > KMALLOC_MAX_CACHE_SIZE)
 			return kmalloc_large_node(size, flags, node);
 
 		index = kmalloc_index(size);
-
-		if (!index)
-			return ZERO_SIZE_PTR;
-
 		return kmalloc_node_trace(
 				kmalloc_caches[kmalloc_type(flags)][index],
 				flags, node, size);

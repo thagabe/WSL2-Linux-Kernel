@@ -15,6 +15,11 @@
 	model = "Supermicro X9SCi-LN4F BMC";
 	compatible = "supermicro,x9sci-ln4f-bmc", "nuvoton,wpcm450";
 
+	aliases {
+		serial0 = &serial0;
+		serial1 = &serial1;
+	};
+
 	chosen {
 		stdout-path = "serial0:115200n8";
 	};
@@ -50,6 +55,15 @@
 			label = "heartbeat";
 			gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;
 		};
+	};
+};
+
+&fiu {
+	status = "okay";
+
+	flash@0 {
+		reg = <0>;
+		compatible = "jedec,spi-nor";
 	};
 };
 
@@ -93,9 +107,5 @@
 
 &serial1 {
 	/* "Serial over LAN" port. Connected to ttyS2 of the host system. */
-	status = "okay";
-};
-
-&watchdog0 {
 	status = "okay";
 };

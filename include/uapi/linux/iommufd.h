@@ -30,7 +30,7 @@
  *    correct.
  *  - ENOENT: An ID or IOVA provided does not exist.
  *  - ENOMEM: Out of memory.
- *  - EOVERFLOW: Mathematics oveflowed.
+ *  - EOVERFLOW: Mathematics overflowed.
  *
  * As well as additional errnos, within specific ioctls.
  */
@@ -104,14 +104,23 @@ struct iommu_iova_range {
  * The allowed ranges are dependent on the HW path the DMA operation takes, and
  * can change during the lifetime of the IOAS. A fresh empty IOAS will have a
  * full range, and each attached device will narrow the ranges based on that
- * device's HW restrictions. Detatching a device can widen the ranges. Userspace
- * should query ranges after every attach/detatch to know what IOVAs are valid
+ * device's HW restrictions. Detaching a device can widen the ranges. Userspace
+ * should query ranges after every attach/detach to know what IOVAs are valid
  * for mapping.
  *
  * On input num_iovas is the length of the allowed_iovas array. On output it is
  * the total number of iovas filled in. The ioctl will return -EMSGSIZE and set
  * num_iovas to the required value if num_iovas is too small. In this case the
  * caller should allocate a larger output array and re-issue the ioctl.
+ *
+ * out_iova_alignment returns the minimum IOVA alignment that can be given
+ * to IOMMU_IOAS_MAP/COPY. IOVA's must satisfy::
+ *
+ *   starting_iova % out_iova_alignment == 0
+ *   (starting_iova + length) % out_iova_alignment == 0
+ *
+ * out_iova_alignment can be 1 indicating any IOVA is allowed. It cannot
+ * be higher than the system PAGE_SIZE.
  */
 struct iommu_ioas_iova_ranges {
 	__u32 size;
@@ -183,6 +192,9 @@ enum iommufd_ioas_map_flags {
  * mapping will be established at iova, otherwise a suitable location based on
  * the reserved and allowed lists will be automatically selected and returned in
  * iova.
+ *
+ * If IOMMU_IOAS_MAP_FIXED_IOVA is specified then the iova range must currently
+ * be unused, existing IOVA cannot be replaced.
  */
 struct iommu_ioas_map {
 	__u32 size;
@@ -211,7 +223,7 @@ struct iommu_ioas_map {
  * IOMMU_IOAS_MAP.
  *
  * This may be used to efficiently clone a subset of an IOAS to another, or as a
- * kind of 'cache' to speed up mapping. Copy has an effciency advantage over
+ * kind of 'cache' to speed up mapping. Copy has an efficiency advantage over
  * establishing equivalent new mappings, as internal resources are shared, and
  * the kernel will pin the user memory only once.
  */
@@ -284,7 +296,7 @@ enum iommufd_option_ops {
  * @object_id: ID of the object if required
  * @val64: Option value to set or value returned on get
  *
- * Change a simple option value. This multiplexor allows controlling a options
+ * Change a simple option value. This multiplexor allows controlling options
  * on objects. IOMMU_OPTION_OP_SET will load an option and IOMMU_OPTION_OP_GET
  * will return the current value.
  */

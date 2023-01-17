@@ -366,7 +366,7 @@ config VIDEO_OV08D10
 
 config VIDEO_OV08X40
 	tristate "OmniVision OV08X40 sensor support"
-	depends on VIDEO_V4L2 && I2C
+	depends on VIDEO_DEV && I2C
 	select MEDIA_CONTROLLER
 	select VIDEO_V4L2_SUBDEV_API
 	select V4L2_FWNODE
@@ -750,16 +750,6 @@ config VIDEO_S5C73M3
 	help
 	  This is a V4L2 sensor driver for Samsung S5C73M3
 	  8 Mpixel camera.
-
-config VIDEO_S5K4ECGX
-	tristate "Samsung S5K4ECGX sensor support"
-	depends on I2C && VIDEO_DEV
-	select MEDIA_CONTROLLER
-	select VIDEO_V4L2_SUBDEV_API
-	select CRC32
-	help
-	  This is a V4L2 sensor driver for Samsung S5K4ECGX 5M
-	  camera sensor with an embedded SoC image signal processor.
 
 config VIDEO_S5K5BAF
 	tristate "Samsung S5K5BAF sensor support"
@@ -1316,7 +1306,6 @@ config VIDEO_TC358746
 	select V4L2_FWNODE
 	select GENERIC_PHY_MIPI_DPHY
 	select REGMAP_I2C
-	select COMMON_CLK
 	help
 	  Support for the Toshiba TC358746 parallel to MIPI CSI-2 bridge.
 	  The bridge can work in both directions but currently only the

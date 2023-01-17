@@ -162,6 +162,13 @@ int iommufd_ioas_allow_iovas(struct iommufd_ucmd *ucmd)
 	if (rc)
 		goto out_free;
 
+	/*
+	 * We want the allowed tree update to be atomic, so we have to keep the
+	 * original nodes around, and keep track of the new nodes as we allocate
+	 * memory for them. The simplest solution is to have a new/old tree and
+	 * then swap new for old. On success we free the old tree, on failure we
+	 * free the new tree.
+	 */
 	rc = iopt_set_allow_iova(iopt, &allowed_iova);
 out_free:
 	while ((node = interval_tree_iter_first(&allowed_iova, 0, ULONG_MAX))) {
@@ -174,8 +181,6 @@ out_free:
 
 static int conv_iommu_prot(u32 map_flags)
 {
-	int iommu_prot;
-
 	/*
 	 * We provide no manual cache coherency ioctls to userspace and most
 	 * architectures make the CPU ops for cache flushing privileged.
@@ -183,7 +188,8 @@ static int conv_iommu_prot(u32 map_flags)
 	 * operation. Support for IOMMU_CACHE is enforced by the
 	 * IOMMU_CAP_CACHE_COHERENCY test during bind.
 	 */
-	iommu_prot = IOMMU_CACHE;
+	int iommu_prot = IOMMU_CACHE;
+
 	if (map_flags & IOMMU_IOAS_MAP_WRITEABLE)
 		iommu_prot |= IOMMU_WRITE;
 	if (map_flags & IOMMU_IOAS_MAP_READABLE)
@@ -194,9 +200,9 @@ static int conv_iommu_prot(u32 map_flags)
 int iommufd_ioas_map(struct iommufd_ucmd *ucmd)
 {
 	struct iommu_ioas_map *cmd = ucmd->cmd;
+	unsigned long iova = cmd->iova;
 	struct iommufd_ioas *ioas;
 	unsigned int flags = 0;
-	unsigned long iova;
 	int rc;
 
 	if ((cmd->flags &
@@ -213,7 +219,6 @@ int iommufd_ioas_map(struct iommufd_ucmd *ucmd)
 
 	if (!(cmd->flags & IOMMU_IOAS_MAP_FIXED_IOVA))
 		flags = IOPT_ALLOC_IOVA;
-	iova = cmd->iova;
 	rc = iopt_map_user_pages(ucmd->ictx, &ioas->iopt, &iova,
 				 u64_to_user_ptr(cmd->user_va), cmd->length,
 				 conv_iommu_prot(cmd->flags), flags);
@@ -317,6 +322,9 @@ out_put:
 int iommufd_option_rlimit_mode(struct iommu_option *cmd,
 			       struct iommufd_ctx *ictx)
 {
+	if (cmd->object_id)
+		return -EOPNOTSUPP;
+
 	if (cmd->op == IOMMU_OPTION_OP_GET) {
 		cmd->val64 = ictx->account_mode == IOPT_PAGES_ACCOUNT_MM;
 		return 0;

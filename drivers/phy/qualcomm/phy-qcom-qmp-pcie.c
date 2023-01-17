@@ -23,8 +23,6 @@
 #include <linux/reset.h>
 #include <linux/slab.h>
 
-#include <dt-bindings/phy/phy.h>
-
 #include "phy-qcom-qmp.h"
 
 /* QPHY_SW_RESET bit */
@@ -1552,6 +1550,8 @@ struct qmp_pcie {
 
 	struct phy *phy;
 	int mode;
+
+	struct clk_fixed_rate pipe_clk_fixed;
 };
 
 static inline void qphy_setbits(void __iomem *base, u32 offset, u32 val)
@@ -2418,7 +2418,7 @@ static void phy_clk_release_provider(void *res)
  */
 static int phy_pipe_clk_register(struct qmp_pcie *qmp, struct device_node *np)
 {
-	struct clk_fixed_rate *fixed;
+	struct clk_fixed_rate *fixed = &qmp->pipe_clk_fixed;
 	struct clk_init_data init = { };
 	int ret;
 
@@ -2427,10 +2427,6 @@ static int phy_pipe_clk_register(struct qmp_pcie *qmp, struct device_node *np)
 		dev_err(qmp->dev, "%pOFn: No clock-output-names\n", np);
 		return ret;
 	}
-
-	fixed = devm_kzalloc(qmp->dev, sizeof(*fixed), GFP_KERNEL);
-	if (!fixed)
-		return -ENOMEM;
 
 	init.ops = &clk_fixed_rate_ops;
 

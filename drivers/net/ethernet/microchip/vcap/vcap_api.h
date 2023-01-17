@@ -11,9 +11,6 @@
 #include <linux/netdevice.h>
 
 /* Use the generated API model */
-#ifdef CONFIG_VCAP_KUNIT_TEST
-#include "vcap_ag_api_kunit.h"
-#endif
 #include "vcap_ag_api.h"
 
 #define VCAP_CID_LOOKUP_SIZE          100000 /* Chains in a lookup */
@@ -167,6 +164,7 @@ struct vcap_admin {
 	struct list_head list; /* for insertion in vcap_control */
 	struct list_head rules; /* list of rules */
 	struct list_head enabled; /* list of enabled ports */
+	struct mutex lock; /* control access to rules */
 	enum vcap_type vtype;  /* type of vcap */
 	int vinst; /* instance number within the same type */
 	int first_cid; /* first chain id in this vcap */
@@ -201,6 +199,13 @@ struct vcap_keyset_list {
 	int max; /* size of the keyset list */
 	int cnt; /* count of keysets actually in the list */
 	enum vcap_keyfield_set *keysets; /* the list of keysets */
+};
+
+/* Client output printf-like function with destination */
+struct vcap_output_print {
+	__printf(2, 3)
+	void (*prf)(void *out, const char *fmt, ...);
+	void *dst;
 };
 
 /* Client supplied VCAP callback operations */
@@ -252,10 +257,8 @@ struct vcap_operations {
 	/* informational */
 	int (*port_info)
 		(struct net_device *ndev,
-		 enum vcap_type vtype,
-		 int (*pf)(void *out, int arg, const char *fmt, ...),
-		 void *out,
-		 int arg);
+		 struct vcap_admin *admin,
+		 struct vcap_output_print *out);
 	/* enable/disable the lookups in a vcap instance */
 	int (*enable)
 		(struct net_device *ndev,
@@ -265,7 +268,6 @@ struct vcap_operations {
 
 /* VCAP API Client control interface */
 struct vcap_control {
-	u32 rule_id; /* last used rule id (unique across VCAP instances) */
 	struct vcap_operations *ops;  /* client supplied operations */
 	const struct vcap_info *vcaps; /* client supplied vcap models */
 	const struct vcap_statistics *stats; /* client supplied vcap stats */

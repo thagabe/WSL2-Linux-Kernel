@@ -12,7 +12,6 @@
 #include <linux/bitops.h>
 #include <api/fs/fs.h>
 #include <api/fs/tracing_path.h>
-#include <traceevent/event-parse.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/perf_event.h>
 #include <linux/compiler.h>
@@ -56,6 +55,10 @@
 #include <internal/threadmap.h>
 
 #include <linux/ctype.h>
+
+#ifdef HAVE_LIBTRACEEVENT
+#include <traceevent/event-parse.h>
+#endif
 
 struct perf_missing_features perf_missing_features;
 
@@ -439,7 +442,9 @@ struct evsel *evsel__clone(struct evsel *orig)
 			goto out_err;
 	}
 	evsel->cgrp = cgroup__get(orig->cgrp);
+#ifdef HAVE_LIBTRACEEVENT
 	evsel->tp_format = orig->tp_format;
+#endif
 	evsel->handler = orig->handler;
 	evsel->core.leader = orig->core.leader;
 
@@ -479,6 +484,7 @@ out_err:
 /*
  * Returns pointer with encoded error via <linux/err.h> interface.
  */
+#ifdef HAVE_LIBTRACEEVENT
 struct evsel *evsel__newtp_idx(const char *sys, const char *name, int idx)
 {
 	struct evsel *evsel = zalloc(perf_evsel__object.size);
@@ -516,6 +522,7 @@ out_free:
 out_err:
 	return ERR_PTR(err);
 }
+#endif
 
 const char *const evsel__hw_names[PERF_COUNT_HW_MAX] = {
 	"cycles",
@@ -2320,11 +2327,8 @@ u64 evsel__bitfield_swap_branch_flags(u64 value)
 	 * as it has variable bit-field sizes. Instead the
 	 * macro takes the bit-field position/size,
 	 * swaps it based on the host endianness.
-	 *
-	 * tep_is_bigendian() is used here instead of
-	 * bigendian() to avoid python test fails.
 	 */
-	if (tep_is_bigendian()) {
+	if (host_is_bigendian()) {
 		new_val = bitfield_swap(value, 0, 1);
 		new_val |= bitfield_swap(value, 1, 1);
 		new_val |= bitfield_swap(value, 2, 1);
@@ -2761,6 +2765,7 @@ u16 evsel__id_hdr_size(struct evsel *evsel)
 	return size;
 }
 
+#ifdef HAVE_LIBTRACEEVENT
 struct tep_format_field *evsel__field(struct evsel *evsel, const char *name)
 {
 	return tep_find_field(evsel->tp_format, name);
@@ -2779,8 +2784,10 @@ void *evsel__rawptr(struct evsel *evsel, struct perf_sample *sample, const char 
 	if (field->flags & TEP_FIELD_IS_DYNAMIC) {
 		offset = *(int *)(sample->raw_data + field->offset);
 		offset &= 0xffff;
+#ifdef HAVE_LIBTRACEEVENT_TEP_FIELD_IS_RELATIVE
 		if (field->flags & TEP_FIELD_IS_RELATIVE)
 			offset += field->offset + field->size;
+#endif
 	}
 
 	return sample->raw_data + offset;
@@ -2834,6 +2841,7 @@ u64 evsel__intval(struct evsel *evsel, struct perf_sample *sample, const char *n
 
 	return field ? format_field__intval(field, sample, evsel->needs_swap) : 0;
 }
+#endif
 
 bool evsel__fallback(struct evsel *evsel, int err, char *msg, size_t msgsize)
 {

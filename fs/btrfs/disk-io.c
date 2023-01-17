@@ -23,7 +23,7 @@
 #include "disk-io.h"
 #include "transaction.h"
 #include "btrfs_inode.h"
-#include "volumes.h"
+#include "bio.h"
 #include "print-tree.h"
 #include "locking.h"
 #include "tree-log.h"
@@ -252,6 +252,30 @@ int btrfs_verify_level_key(struct extent_buffer *eb, int level,
 			  found_key.objectid, found_key.type,
 			  found_key.offset);
 	}
+	return ret;
+}
+
+static int btrfs_repair_eb_io_failure(const struct extent_buffer *eb,
+				      int mirror_num)
+{
+	struct btrfs_fs_info *fs_info = eb->fs_info;
+	u64 start = eb->start;
+	int i, num_pages = num_extent_pages(eb);
+	int ret = 0;
+
+	if (sb_rdonly(fs_info->sb))
+		return -EROFS;
+
+	for (i = 0; i < num_pages; i++) {
+		struct page *p = eb->pages[i];
+
+		ret = btrfs_repair_io_failure(fs_info, 0, start, PAGE_SIZE,
+				start, p, start - page_offset(p), mirror_num);
+		if (ret)
+			break;
+		start += PAGE_SIZE;
+	}
+
 	return ret;
 }
 
@@ -506,6 +530,9 @@ static int validate_extent_buffer(struct extent_buffer *eb,
 	}
 
 	if (found_level != check->level) {
+		btrfs_err(fs_info,
+		"level verify failed on logical %llu mirror %u wanted %u found %u",
+			  eb->start, eb->read_mirror, check->level, found_level);
 		ret = -EIO;
 		goto out;
 	}
@@ -3357,6 +3384,8 @@ out:
 /*
  * Do various sanity and dependency checks of different features.
  *
+ * @is_rw_mount:	If the mount is read-write.
+ *
  * This is the place for less strict checks (like for subpage or artificial
  * feature dependencies).
  *
@@ -3367,7 +3396,7 @@ out:
  * (space cache related) can modify on-disk format like free space tree and
  * screw up certain feature dependencies.
  */
-int btrfs_check_features(struct btrfs_fs_info *fs_info, struct super_block *sb)
+int btrfs_check_features(struct btrfs_fs_info *fs_info, bool is_rw_mount)
 {
 	struct btrfs_super_block *disk_super = fs_info->super_copy;
 	u64 incompat = btrfs_super_incompat_flags(disk_super);
@@ -3406,7 +3435,7 @@ int btrfs_check_features(struct btrfs_fs_info *fs_info, struct super_block *sb)
 	if (btrfs_super_nodesize(disk_super) > PAGE_SIZE)
 		incompat |= BTRFS_FEATURE_INCOMPAT_BIG_METADATA;
 
-	if (compat_ro_unsupp && !sb_rdonly(sb)) {
+	if (compat_ro_unsupp && is_rw_mount) {
 		btrfs_err(fs_info,
 	"cannot mount read-write because of unknown compat_ro features (0x%llx)",
 		       compat_ro);
@@ -3609,7 +3638,7 @@ int __cold open_ctree(struct super_block *sb, struct btrfs_fs_devices *fs_device
 		goto fail_alloc;
 	}
 
-	ret = btrfs_check_features(fs_info, sb);
+	ret = btrfs_check_features(fs_info, !sb_rdonly(sb));
 	if (ret < 0) {
 		err = ret;
 		goto fail_alloc;
@@ -3944,7 +3973,7 @@ static void btrfs_end_super_write(struct bio *bio)
 		if (bio->bi_status) {
 			btrfs_warn_rl_in_rcu(device->fs_info,
 				"lost page write due to IO error on %s (%d)",
-				rcu_str_deref(device->name),
+				btrfs_dev_name(device),
 				blk_status_to_errno(bio->bi_status));
 			ClearPageUptodate(page);
 			SetPageError(page);
@@ -4158,7 +4187,7 @@ static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
 		max_mirrors = BTRFS_SUPER_MIRROR_MAX;
 
 	for (i = 0; i < max_mirrors; i++) {
-		struct folio *folio;
+		struct page *page;
 
 		ret = btrfs_sb_log_location(device, i, READ, &bytenr);
 		if (ret == -ENOENT) {
@@ -4173,24 +4202,27 @@ static int wait_dev_supers(struct btrfs_device *device, int max_mirrors)
 		    device->commit_total_bytes)
 			break;
 
-		folio = filemap_get_folio(device->bdev->bd_inode->i_mapping,
+		page = find_get_page(device->bdev->bd_inode->i_mapping,
 				     bytenr >> PAGE_SHIFT);
-		if (!folio) {
+		if (!page) {
 			errors++;
 			if (i == 0)
 				primary_failed = true;
 			continue;
 		}
-		/* Folio is unlocked once the IO completes */
-		folio_wait_locked(folio);
-		if (!folio_test_uptodate(folio)) {
+		/* Page is submitted locked and unlocked once the IO completes */
+		wait_on_page_locked(page);
+		if (PageError(page)) {
 			errors++;
 			if (i == 0)
 				primary_failed = true;
 		}
 
-		/* Drop our reference and the one from the writing run */
-		folio_put_refs(folio, 2);
+		/* Drop our reference */
+		put_page(page);
+
+		/* Drop the reference from the writing run */
+		put_page(page);
 	}
 
 	/* log error, force error return */

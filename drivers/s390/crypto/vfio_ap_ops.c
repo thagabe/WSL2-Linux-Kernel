@@ -429,7 +429,7 @@ static struct ap_queue_status vfio_ap_irq_enable(struct vfio_ap_queue *q,
 
 	aqic_gisa.isc = nisc;
 	aqic_gisa.ir = 1;
-	aqic_gisa.gisa = (uint64_t)gisa >> 4;
+	aqic_gisa.gisa = virt_to_phys(gisa) >> 4;
 
 	status = ap_aqic(q->apqn, aqic_gisa, h_nib);
 	switch (status.response_code) {
@@ -1530,13 +1530,29 @@ static int vfio_ap_mdev_set_kvm(struct ap_matrix_mdev *matrix_mdev,
 	return 0;
 }
 
+static void unmap_iova(struct ap_matrix_mdev *matrix_mdev, u64 iova, u64 length)
+{
+	struct ap_queue_table *qtable = &matrix_mdev->qtable;
+	struct vfio_ap_queue *q;
+	int loop_cursor;
+
+	hash_for_each(qtable->queues, loop_cursor, q, mdev_qnode) {
+		if (q->saved_iova >= iova && q->saved_iova < iova + length)
+			vfio_ap_irq_disable(q);
+	}
+}
+
 static void vfio_ap_mdev_dma_unmap(struct vfio_device *vdev, u64 iova,
 				   u64 length)
 {
 	struct ap_matrix_mdev *matrix_mdev =
 		container_of(vdev, struct ap_matrix_mdev, vdev);
 
-	vfio_unpin_pages(&matrix_mdev->vdev, iova, 1);
+	mutex_lock(&matrix_dev->mdevs_lock);
+
+	unmap_iova(matrix_mdev, iova, length);
+
+	mutex_unlock(&matrix_dev->mdevs_lock);
 }
 
 /**
@@ -1582,52 +1598,12 @@ static struct vfio_ap_queue *vfio_ap_find_queue(int apqn)
 	return q;
 }
 
-static int vfio_ap_wait_4_reset_complete(struct vfio_ap_queue *q)
-{
-	int iters = 2, ret = 0;
-	struct ap_queue_status status;
-
-	while (iters--) {
-		msleep(20);
-		status = ap_tapq(q->apqn, NULL);
-
-		switch (status.response_code) {
-		case AP_RESPONSE_NORMAL:
-			ret = 0;
-
-			if (status.queue_empty && !status.irq_enabled)
-				goto verify_done;
-			break;
-		case AP_RESPONSE_RESET_IN_PROGRESS:
-			ret = -EBUSY;
-			break;
-		case AP_RESPONSE_DECONFIGURED:
-			ret = 0;
-			goto verify_done;
-		default:
-			ret = -EIO;
-			WARN(true,
-			     "failed to verify reset of queue %02x.%04x: TAPQ rc=%u\n",
-			     AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
-			     status.response_code);
-			goto verify_done;
-		}
-	}
-
-	WARN_ONCE(iters <= 0,
-		  "timeout verifying reset of queue %02x.%04x (%u, %u, %u)",
-		  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn),
-		  status.queue_empty, status.irq_enabled, status.response_code);
-
-verify_done:
-	return ret;
-}
-
 static int vfio_ap_mdev_reset_queue(struct vfio_ap_queue *q,
 				    unsigned int retry)
 {
 	struct ap_queue_status status;
 	int ret;
+	int retry2 = 2;
 
 	if (!q)
 		return 0;
@@ -1663,9 +1639,15 @@ retry_zapq:
 		return -EIO;
 	}
 
-	/* if the reset has not completed, wait for it to take effect */
-	if (!status.queue_empty || status.irq_enabled)
-		ret = vfio_ap_wait_4_reset_complete(q);
+	/* wait for the reset to take effect */
+	while (retry2--) {
+		if (status.queue_empty && !status.irq_enabled)
+			break;
+		msleep(20);
+		status = ap_tapq(q->apqn, NULL);
+	}
+	WARN_ONCE(retry2 <= 0, "unable to verify reset of queue %02x.%04x",
+		  AP_QID_CARD(q->apqn), AP_QID_QUEUE(q->apqn));
 
 free_resources:
 	vfio_ap_free_aqic_resources(q);

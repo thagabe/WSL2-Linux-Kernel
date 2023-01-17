@@ -114,6 +114,9 @@ struct devlink_rate {
 			refcount_t refcnt;
 		};
 	};
+
+	u32 tx_priority;
+	u32 tx_weight;
 };
 
 struct devlink_port {
@@ -618,6 +621,8 @@ enum devlink_param_generic_id {
 #define DEVLINK_INFO_VERSION_GENERIC_FW_ROCE	"fw.roce"
 /* Firmware bundle identifier */
 #define DEVLINK_INFO_VERSION_GENERIC_FW_BUNDLE_ID	"fw.bundle_id"
+/* Bootloader */
+#define DEVLINK_INFO_VERSION_GENERIC_FW_BOOTLOADER	"fw.bootloader"
 
 /**
  * struct devlink_flash_update_params - Flash Update parameters
@@ -647,6 +652,10 @@ struct devlink_info_req;
  *            the data variable must be updated to point to the snapshot data.
  *            The function will be called while the devlink instance lock is
  *            held.
+ * @read: callback to directly read a portion of the region. On success,
+ *        the data pointer will be updated with the contents of the
+ *        requested portion of the region. The function will be called
+ *        while the devlink instance lock is held.
  * @priv: Pointer to driver private data for the region operation
  */
 struct devlink_region_ops {
@@ -656,6 +665,10 @@ struct devlink_region_ops {
 			const struct devlink_region_ops *ops,
 			struct netlink_ext_ack *extack,
 			u8 **data);
+	int (*read)(struct devlink *devlink,
+		    const struct devlink_region_ops *ops,
+		    struct netlink_ext_ack *extack,
+		    u64 offset, u32 size, u8 *data);
 	void *priv;
 };
 
@@ -667,6 +680,10 @@ struct devlink_region_ops {
  *            the data variable must be updated to point to the snapshot data.
  *            The function will be called while the devlink instance lock is
  *            held.
+ * @read: callback to directly read a portion of the region. On success,
+ *        the data pointer will be updated with the contents of the
+ *        requested portion of the region. The function will be called
+ *        while the devlink instance lock is held.
  * @priv: Pointer to driver private data for the region operation
  */
 struct devlink_port_region_ops {
@@ -676,6 +693,10 @@ struct devlink_port_region_ops {
 			const struct devlink_port_region_ops *ops,
 			struct netlink_ext_ack *extack,
 			u8 **data);
+	int (*read)(struct devlink_port *port,
+		    const struct devlink_port_region_ops *ops,
+		    struct netlink_ext_ack *extack,
+		    u64 offset, u32 size, u8 *data);
 	void *priv;
 };
 
@@ -1433,6 +1454,45 @@ struct devlink_ops {
 					 const u8 *hw_addr, int hw_addr_len,
 					 struct netlink_ext_ack *extack);
 	/**
+	 * @port_fn_roce_get: Port function's roce get function.
+	 *
+	 * Query RoCE state of a function managed by the devlink port.
+	 * Return -EOPNOTSUPP if port function RoCE handling is not supported.
+	 */
+	int (*port_fn_roce_get)(struct devlink_port *devlink_port,
+				bool *is_enable,
+				struct netlink_ext_ack *extack);
+	/**
+	 * @port_fn_roce_set: Port function's roce set function.
+	 *
+	 * Enable/Disable the RoCE state of a function managed by the devlink
+	 * port.
+	 * Return -EOPNOTSUPP if port function RoCE handling is not supported.
+	 */
+	int (*port_fn_roce_set)(struct devlink_port *devlink_port,
+				bool enable, struct netlink_ext_ack *extack);
+	/**
+	 * @port_fn_migratable_get: Port function's migratable get function.
+	 *
+	 * Query migratable state of a function managed by the devlink port.
+	 * Return -EOPNOTSUPP if port function migratable handling is not
+	 * supported.
+	 */
+	int (*port_fn_migratable_get)(struct devlink_port *devlink_port,
+				      bool *is_enable,
+				      struct netlink_ext_ack *extack);
+	/**
+	 * @port_fn_migratable_set: Port function's migratable set function.
+	 *
+	 * Enable/Disable migratable state of a function managed by the devlink
+	 * port.
+	 * Return -EOPNOTSUPP if port function migratable handling is not
+	 * supported.
+	 */
+	int (*port_fn_migratable_set)(struct devlink_port *devlink_port,
+				      bool enable,
+				      struct netlink_ext_ack *extack);
+	/**
 	 * port_new() - Add a new port function of a specified flavor
 	 * @devlink: Devlink instance
 	 * @attrs: attributes of the new port
@@ -1511,10 +1571,18 @@ struct devlink_ops {
 				      u64 tx_share, struct netlink_ext_ack *extack);
 	int (*rate_leaf_tx_max_set)(struct devlink_rate *devlink_rate, void *priv,
 				    u64 tx_max, struct netlink_ext_ack *extack);
+	int (*rate_leaf_tx_priority_set)(struct devlink_rate *devlink_rate, void *priv,
+					 u32 tx_priority, struct netlink_ext_ack *extack);
+	int (*rate_leaf_tx_weight_set)(struct devlink_rate *devlink_rate, void *priv,
+				       u32 tx_weight, struct netlink_ext_ack *extack);
 	int (*rate_node_tx_share_set)(struct devlink_rate *devlink_rate, void *priv,
 				      u64 tx_share, struct netlink_ext_ack *extack);
 	int (*rate_node_tx_max_set)(struct devlink_rate *devlink_rate, void *priv,
 				    u64 tx_max, struct netlink_ext_ack *extack);
+	int (*rate_node_tx_priority_set)(struct devlink_rate *devlink_rate, void *priv,
+					 u32 tx_priority, struct netlink_ext_ack *extack);
+	int (*rate_node_tx_weight_set)(struct devlink_rate *devlink_rate, void *priv,
+				       u32 tx_weight, struct netlink_ext_ack *extack);
 	int (*rate_node_new)(struct devlink_rate *rate_node, void **priv,
 			     struct netlink_ext_ack *extack);
 	int (*rate_node_del)(struct devlink_rate *rate_node, void *priv,
@@ -1606,7 +1674,12 @@ void devlink_port_attrs_pci_vf_set(struct devlink_port *devlink_port, u32 contro
 void devlink_port_attrs_pci_sf_set(struct devlink_port *devlink_port,
 				   u32 controller, u16 pf, u32 sf,
 				   bool external);
-int devl_rate_leaf_create(struct devlink_port *port, void *priv);
+struct devlink_rate *
+devl_rate_node_create(struct devlink *devlink, void *priv, char *node_name,
+		      struct devlink_rate *parent);
+int
+devl_rate_leaf_create(struct devlink_port *devlink_port, void *priv,
+		      struct devlink_rate *parent);
 void devl_rate_leaf_destroy(struct devlink_port *devlink_port);
 void devl_rate_nodes_destroy(struct devlink *devlink);
 void devlink_port_linecard_set(struct devlink_port *devlink_port,
@@ -1730,8 +1803,6 @@ int devlink_region_snapshot_create(struct devlink_region *region,
 				   u8 *data, u32 snapshot_id);
 int devlink_info_serial_number_put(struct devlink_info_req *req,
 				   const char *sn);
-int devlink_info_driver_name_put(struct devlink_info_req *req,
-				 const char *name);
 int devlink_info_board_serial_number_put(struct devlink_info_req *req,
 					 const char *bsn);
 

@@ -17,18 +17,18 @@ EXPORT_SYMBOL_GPL(interval_tree_iter_first);
 EXPORT_SYMBOL_GPL(interval_tree_iter_next);
 
 #ifdef CONFIG_INTERVAL_TREE_SPAN_ITER
+/*
+ * Roll nodes[1] into nodes[0] by advancing nodes[1] to the end of a contiguous
+ * span of nodes. This makes nodes[0]->last the end of that contiguous used span
+ * indexes that started at the original nodes[1]->start. nodes[1] is now the
+ * first node starting the next used span. A hole span is between nodes[0]->last
+ * and nodes[1]->start. nodes[1] must be !NULL.
+ */
 static void
 interval_tree_span_iter_next_gap(struct interval_tree_span_iter *state)
 {
 	struct interval_tree_node *cur = state->nodes[1];
 
-	/*
-	 * Roll nodes[1] into nodes[0] by advancing nodes[1] to the end of a
-	 * contiguous span of nodes. This makes nodes[0]->last the end of that
-	 * contiguous span of valid indexes that started at the original
-	 * nodes[1]->start. nodes[1] is now the next node and a hole is between
-	 * nodes[0] and [1].
-	 */
 	state->nodes[0] = cur;
 	do {
 		if (cur->last > state->nodes[0]->last)

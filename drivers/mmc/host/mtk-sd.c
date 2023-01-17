@@ -1224,9 +1224,7 @@ static bool msdc_cmd_done(struct msdc_host *host, int events,
 
 	if (!sbc_error && !(events & MSDC_INT_CMDRDY)) {
 		if (events & MSDC_INT_CMDTMO ||
-		    (cmd->opcode != MMC_SEND_TUNING_BLOCK &&
-		     cmd->opcode != MMC_SEND_TUNING_BLOCK_HS200 &&
-		     !host->hs400_tuning))
+		    (!mmc_op_tuning(cmd->opcode) && !host->hs400_tuning))
 			/*
 			 * should not clear fifo/interrupt as the tune data
 			 * may have already come when cmd19/cmd21 gets response
@@ -1320,9 +1318,7 @@ static void msdc_cmd_next(struct msdc_host *host,
 {
 	if ((cmd->error &&
 	    !(cmd->error == -EILSEQ &&
-	      (cmd->opcode == MMC_SEND_TUNING_BLOCK ||
-	       cmd->opcode == MMC_SEND_TUNING_BLOCK_HS200 ||
-	       host->hs400_tuning))) ||
+	      (mmc_op_tuning(cmd->opcode) || host->hs400_tuning))) ||
 	    (mrq->sbc && mrq->sbc->error))
 		msdc_request_done(host, mrq);
 	else if (cmd == mrq->sbc)
@@ -2605,12 +2601,10 @@ static int msdc_of_clock_parse(struct platform_device *pdev,
 			return PTR_ERR(host->src_clk_cg);
 	}
 
-	host->sys_clk_cg = devm_clk_get_optional(&pdev->dev, "sys_cg");
+	/* If present, always enable for this clock gate */
+	host->sys_clk_cg = devm_clk_get_optional_enabled(&pdev->dev, "sys_cg");
 	if (IS_ERR(host->sys_clk_cg))
 		host->sys_clk_cg = NULL;
-
-	/* If present, always enable for this clock gate */
-	clk_prepare_enable(host->sys_clk_cg);
 
 	host->bulk_clks[0].id = "pclk_cg";
 	host->bulk_clks[1].id = "axi_cg";

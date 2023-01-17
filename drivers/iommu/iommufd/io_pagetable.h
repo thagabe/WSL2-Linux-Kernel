@@ -33,7 +33,7 @@ struct iommu_domain;
  *
  * The io_pagetable::iova_rwsem protects node
  * The iopt_pages::mutex protects pages_node
- * iopt and immu_prot are immutable
+ * iopt and iommu_prot are immutable
  * The pages::mutex protects num_accesses
  */
 struct iopt_area {
@@ -221,10 +221,10 @@ int iopt_pages_fill_xarray(struct iopt_pages *pages, unsigned long start,
 void iopt_pages_unfill_xarray(struct iopt_pages *pages, unsigned long start,
 			      unsigned long last);
 
-int iopt_pages_add_access(struct iopt_pages *pages, unsigned long start,
-			unsigned long last, struct page **out_pages,
-			unsigned int flags);
-void iopt_pages_remove_access(struct iopt_area *area, unsigned long start,
+int iopt_area_add_access(struct iopt_area *area, unsigned long start,
+			 unsigned long last, struct page **out_pages,
+			 unsigned int flags);
+void iopt_area_remove_access(struct iopt_area *area, unsigned long start,
 			    unsigned long last);
 int iopt_pages_rw_access(struct iopt_pages *pages, unsigned long start_byte,
 			 void *data, unsigned long length, unsigned int flags);
@@ -235,7 +235,7 @@ int iopt_pages_rw_access(struct iopt_pages *pages, unsigned long start_byte,
  */
 struct iopt_pages_access {
 	struct interval_tree_node node;
-	refcount_t refcount;
+	unsigned int users;
 };
 
 #endif

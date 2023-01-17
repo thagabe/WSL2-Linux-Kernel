@@ -354,6 +354,11 @@ static bool is_el1_mte_sync_tag_check_fault(unsigned long esr)
 	return false;
 }
 
+static bool is_translation_fault(unsigned long esr)
+{
+	return (esr & ESR_ELx_FSC_TYPE) == ESR_ELx_FSC_FAULT;
+}
+
 static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 			      struct pt_regs *regs)
 {
@@ -386,7 +391,8 @@ static void __do_kernel_fault(unsigned long addr, unsigned long esr,
 	} else if (addr < PAGE_SIZE) {
 		msg = "NULL pointer dereference";
 	} else {
-		if (kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
+		if (is_translation_fault(esr) &&
+		    kfence_handle_page_fault(addr, esr & ESR_ELx_WNR, regs))
 			return;
 
 		msg = "paging request";
@@ -458,7 +464,7 @@ static void set_thread_esr(unsigned long address, unsigned long esr)
 static void do_bad_area(unsigned long far, unsigned long esr,
 			struct pt_regs *regs)
 {
-	unsigned long addr = untagged_addr(current->mm, far);
+	unsigned long addr = untagged_addr(far);
 
 	/*
 	 * If we are in kernel mode at this point, we have no context to
@@ -528,7 +534,7 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	vm_fault_t fault;
 	unsigned long vm_flags;
 	unsigned int mm_flags = FAULT_FLAG_DEFAULT;
-	unsigned long addr = untagged_addr(mm, far);
+	unsigned long addr = untagged_addr(far);
 
 	if (kprobe_page_fault(regs, esr))
 		return 0;
@@ -683,7 +689,7 @@ static int __kprobes do_translation_fault(unsigned long far,
 					  unsigned long esr,
 					  struct pt_regs *regs)
 {
-	unsigned long addr = untagged_addr(current->mm, far);
+	unsigned long addr = untagged_addr(far);
 
 	if (is_ttbr0_addr(addr))
 		return do_page_fault(far, esr, regs);
@@ -730,7 +736,7 @@ static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 		 * UNKNOWN for synchronous external aborts. Mask them out now
 		 * so that userspace doesn't see them.
 		 */
-		siaddr  = untagged_addr(current->mm, far);
+		siaddr  = untagged_addr(far);
 	}
 	arm64_notify_die(inf->name, regs, inf->sig, inf->code, siaddr, esr);
 
@@ -820,7 +826,7 @@ static const struct fault_info fault_info[] = {
 void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf = esr_to_fault_info(esr);
-	unsigned long addr = untagged_addr(current->mm, far);
+	unsigned long addr = untagged_addr(far);
 
 	if (!inf->fn(far, esr, regs))
 		return;
@@ -937,6 +943,8 @@ struct page *alloc_zeroed_user_highpage_movable(struct vm_area_struct *vma,
 
 void tag_clear_highpage(struct page *page)
 {
+	/* Newly allocated page, shouldn't have been tagged yet */
+	WARN_ON_ONCE(!try_page_mte_tagging(page));
 	mte_zero_clear_page_tags(page_address(page));
-	set_bit(PG_mte_tagged, &page->flags);
+	set_page_mte_tagged(page);
 }

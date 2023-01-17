@@ -28,7 +28,8 @@
 			reg = <0x2600000 0x210000>;
 			resets = <&bpmp TEGRA234_RESET_GPCDMA>;
 			reset-names = "gpcdma";
-			interrupts = <GIC_SPI 76 IRQ_TYPE_LEVEL_HIGH>,
+			interrupts = <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 76 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 77 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 78 IRQ_TYPE_LEVEL_HIGH>,
 				     <GIC_SPI 79 IRQ_TYPE_LEVEL_HIGH>,
@@ -61,6 +62,7 @@
 				     <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>;
 			#dma-cells = <1>;
 			iommus = <&smmu_niso0 TEGRA234_SID_GPCDMA>;
+			dma-channel-mask = <0xfffffffe>;
 			dma-coherent;
 		};
 
@@ -909,7 +911,6 @@
 				 <&bpmp TEGRA234_CLK_QSPI0_PM>;
 			clock-names = "qspi", "qspi_out";
 			resets = <&bpmp TEGRA234_RESET_QSPI0>;
-			reset-names = "qspi";
 			status = "disabled";
 		};
 
@@ -993,12 +994,11 @@
 				 <&bpmp TEGRA234_CLK_QSPI1_PM>;
 			clock-names = "qspi", "qspi_out";
 			resets = <&bpmp TEGRA234_RESET_QSPI1>;
-			reset-names = "qspi";
 			status = "disabled";
 		};
 
 		mmc@3400000 {
-			compatible = "nvidia,tegra194-sdhci", "nvidia,tegra234-sdhci";
+			compatible = "nvidia,tegra234-sdhci", "nvidia,tegra186-sdhci";
 			reg = <0x03400000 0x20000>;
 			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&bpmp TEGRA234_CLK_SDMMC1>,
@@ -1062,7 +1062,7 @@
 		};
 
 		hda@3510000 {
-			compatible = "nvidia,tegra234-hda", "nvidia,tegra30-hda";
+			compatible = "nvidia,tegra234-hda";
 			reg = <0x3510000 0x10000>;
 			interrupts = <GIC_SPI 60 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&bpmp TEGRA234_CLK_AZA_BIT>,
@@ -1084,16 +1084,6 @@
 			reg = <0x03810000 0x10000>;
 			clocks = <&bpmp TEGRA234_CLK_FUSE>;
 			clock-names = "fuse";
-		};
-
-		hte_lic: hardware-timestamp@3aa0000 {
-			compatible = "nvidia,tegra234-gte-lic";
-			reg = <0x3aa0000 0x10000>;
-			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
-			nvidia,int-threshold = <1>;
-			nvidia,slices = <17>;
-			#timestamp-cells = <1>;
-			status = "okay";
 		};
 
 		hsp_top0: hsp@3c00000 {
@@ -1613,16 +1603,6 @@
 			#mbox-cells = <2>;
 		};
 
-		hte_aon: hardware-timestamp@c1e0000 {
-			compatible = "nvidia,tegra234-gte-aon";
-			reg = <0xc1e0000 0x10000>;
-			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
-			nvidia,int-threshold = <1>;
-			nvidia,slices = <3>;
-			#timestamp-cells = <1>;
-			status = "okay";
-		};
-
 		gen2_i2c: i2c@c240000 {
 			compatible = "nvidia,tegra194-i2c";
 			reg = <0xc240000 0x100>;
@@ -2065,8 +2045,9 @@
 		reg = <0x00 0x140a0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x2a000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x2a040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x2a080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x2a080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x35 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2118,8 +2099,9 @@
 		reg = <0x00 0x140c0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x2c000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x2c040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x2c080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x2c080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x38 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2171,8 +2153,9 @@
 		reg = <0x00 0x140e0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x2e000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x2e040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x2e080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x2e080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x3b 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2224,8 +2207,9 @@
 		reg = <0x00 0x14100000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x30000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x30040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x30080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x30080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x20 0xb0000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2277,8 +2261,9 @@
 		reg = <0x00 0x14120000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x32000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x32040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x32080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x32080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x20 0xf0000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2330,8 +2315,9 @@
 		reg = <0x00 0x14140000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x34000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x34040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x34080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x34080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x21 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2364,7 +2350,7 @@
 		bus-range = <0x0 0xff>;
 
 		ranges = <0x43000000 0x21 0x00000000 0x21 0x00000000 0x0 0x28000000>, /* prefetchable memory (640 MB) */
-			 <0x02000000 0x0  0x40000000 0x21 0xe8000000 0x0 0x08000000>, /* non-prefetchable memory (128 MB) */
+			 <0x02000000 0x0  0x40000000 0x21 0x28000000 0x0 0x08000000>, /* non-prefetchable memory (128 MB) */
 			 <0x01000000 0x0  0x34100000 0x00 0x34100000 0x0 0x00100000>; /* downstream I/O (1 MB) */
 
 		interconnects = <&mc TEGRA234_MEMORY_CLIENT_PCIE3R &emc>,
@@ -2383,8 +2369,9 @@
 		reg = <0x00 0x14160000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x36000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x36040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x36080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x36080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x24 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2436,8 +2423,9 @@
 		reg = <0x00 0x14180000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x38000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x38040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x38080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x38080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x27 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2489,8 +2477,9 @@
 		reg = <0x00 0x141a0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x3a000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x3a040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x3a080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x3a080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x2b 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2542,8 +2531,9 @@
 		reg = <0x00 0x141c0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x3c000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x3c040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x3c080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x3c080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x2e 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -2595,8 +2585,9 @@
 		reg = <0x00 0x141e0000 0x0 0x00020000>, /* appl registers (128K)      */
 		      <0x00 0x3e000000 0x0 0x00040000>, /* configuration space (256K) */
 		      <0x00 0x3e040000 0x0 0x00040000>, /* iATU_DMA reg space (256K)  */
-		      <0x00 0x3e080000 0x0 0x00040000>; /* DBI reg space (256K)       */
-		reg-names = "appl", "config", "atu_dma", "dbi";
+		      <0x00 0x3e080000 0x0 0x00040000>, /* DBI reg space (256K)       */
+		      <0x32 0x30000000 0x0 0x10000000>; /* ECAM (256MB)               */
+		reg-names = "appl", "config", "atu_dma", "dbi", "ecam";
 
 		#address-cells = <3>;
 		#size-cells = <2>;
@@ -3091,117 +3082,150 @@
 		};
 
 		l2c0_0: l2-cache00 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c0>;
 		};
 
 		l2c0_1: l2-cache01 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c0>;
 		};
 
 		l2c0_2: l2-cache02 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c0>;
 		};
 
 		l2c0_3: l2-cache03 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c0>;
 		};
 
 		l2c1_0: l2-cache10 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c1>;
 		};
 
 		l2c1_1: l2-cache11 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c1>;
 		};
 
 		l2c1_2: l2-cache12 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c1>;
 		};
 
 		l2c1_3: l2-cache13 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c1>;
 		};
 
 		l2c2_0: l2-cache20 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c2>;
 		};
 
 		l2c2_1: l2-cache21 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c2>;
 		};
 
 		l2c2_2: l2-cache22 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c2>;
 		};
 
 		l2c2_3: l2-cache23 {
+			compatible = "cache";
 			cache-size = <262144>;
 			cache-line-size = <64>;
 			cache-sets = <512>;
 			cache-unified;
+			cache-level = <2>;
 			next-level-cache = <&l3c2>;
 		};
 
 		l3c0: l3-cache0 {
+			compatible = "cache";
+			cache-unified;
 			cache-size = <2097152>;
 			cache-line-size = <64>;
 			cache-sets = <2048>;
+			cache-level = <3>;
 		};
 
 		l3c1: l3-cache1 {
+			compatible = "cache";
+			cache-unified;
 			cache-size = <2097152>;
 			cache-line-size = <64>;
 			cache-sets = <2048>;
+			cache-level = <3>;
 		};
 
 		l3c2: l3-cache2 {
+			compatible = "cache";
+			cache-unified;
 			cache-size = <2097152>;
 			cache-line-size = <64>;
 			cache-sets = <2048>;
+			cache-level = <3>;
 		};
 	};
 

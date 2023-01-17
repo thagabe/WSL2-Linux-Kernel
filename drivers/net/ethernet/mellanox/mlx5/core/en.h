@@ -103,11 +103,11 @@ struct page_pool;
  * size actually used at runtime, but it's not a problem when calculating static
  * array sizes.
  */
-#define MLX5_UMR_MAX_MTT_SPACE \
+#define MLX5_UMR_MAX_FLEX_SPACE \
 	(ALIGN_DOWN(MLX5_SEND_WQE_MAX_SIZE - sizeof(struct mlx5e_umr_wqe), \
-		    MLX5_UMR_MTT_ALIGNMENT))
+		    MLX5_UMR_FLEX_ALIGNMENT))
 #define MLX5_MPWRQ_MAX_PAGES_PER_WQE \
-	rounddown_pow_of_two(MLX5_UMR_MAX_MTT_SPACE / sizeof(struct mlx5_mtt))
+	rounddown_pow_of_two(MLX5_UMR_MAX_FLEX_SPACE / sizeof(struct mlx5_mtt))
 
 #define MLX5E_MAX_RQ_NUM_MTTS	\
 	(ALIGN_DOWN(U16_MAX, 4) * 2) /* Fits into u16 and aligned by WQEBB. */
@@ -160,7 +160,7 @@ struct page_pool;
 	(((wqe_size) - sizeof(struct mlx5e_umr_wqe)) / sizeof(struct mlx5_klm))
 
 #define MLX5E_KLM_ENTRIES_PER_WQE(wqe_size)\
-	ALIGN_DOWN(MLX5E_KLM_MAX_ENTRIES_PER_WQE(wqe_size), MLX5_UMR_KLM_ALIGNMENT)
+	ALIGN_DOWN(MLX5E_KLM_MAX_ENTRIES_PER_WQE(wqe_size), MLX5_UMR_KLM_NUM_ENTRIES_ALIGNMENT)
 
 #define MLX5E_MAX_KLM_PER_WQE(mdev) \
 	MLX5E_KLM_ENTRIES_PER_WQE(MLX5_SEND_WQE_BB * mlx5e_get_max_sq_aligned_wqebbs(mdev))
@@ -1245,4 +1245,5 @@ int mlx5e_set_vf_rate(struct net_device *dev, int vf, int min_tx_rate, int max_t
 int mlx5e_get_vf_config(struct net_device *dev, int vf, struct ifla_vf_info *ivi);
 int mlx5e_get_vf_stats(struct net_device *dev, int vf, struct ifla_vf_stats *vf_stats);
 #endif
+int mlx5e_create_mkey(struct mlx5_core_dev *mdev, u32 pdn, u32 *mkey);
 #endif /* __MLX5_EN_H__ */

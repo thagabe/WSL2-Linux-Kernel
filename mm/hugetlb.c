@@ -255,6 +255,152 @@ static inline struct hugepage_subpool *subpool_vma(struct vm_area_struct *vma)
 	return subpool_inode(file_inode(vma->vm_file));
 }
 
+/*
+ * hugetlb vma_lock helper routines
+ */
+static bool __vma_shareable_lock(struct vm_area_struct *vma)
+{
+	return vma->vm_flags & (VM_MAYSHARE | VM_SHARED) &&
+		vma->vm_private_data;
+}
+
+void hugetlb_vma_lock_read(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		down_read(&vma_lock->rw_sema);
+	}
+}
+
+void hugetlb_vma_unlock_read(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		up_read(&vma_lock->rw_sema);
+	}
+}
+
+void hugetlb_vma_lock_write(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		down_write(&vma_lock->rw_sema);
+	}
+}
+
+void hugetlb_vma_unlock_write(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		up_write(&vma_lock->rw_sema);
+	}
+}
+
+int hugetlb_vma_trylock_write(struct vm_area_struct *vma)
+{
+	struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+	if (!__vma_shareable_lock(vma))
+		return 1;
+
+	return down_write_trylock(&vma_lock->rw_sema);
+}
+
+void hugetlb_vma_assert_locked(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		lockdep_assert_held(&vma_lock->rw_sema);
+	}
+}
+
+void hugetlb_vma_lock_release(struct kref *kref)
+{
+	struct hugetlb_vma_lock *vma_lock = container_of(kref,
+			struct hugetlb_vma_lock, refs);
+
+	kfree(vma_lock);
+}
+
+static void __hugetlb_vma_unlock_write_put(struct hugetlb_vma_lock *vma_lock)
+{
+	struct vm_area_struct *vma = vma_lock->vma;
+
+	/*
+	 * vma_lock structure may or not be released as a result of put,
+	 * it certainly will no longer be attached to vma so clear pointer.
+	 * Semaphore synchronizes access to vma_lock->vma field.
+	 */
+	vma_lock->vma = NULL;
+	vma->vm_private_data = NULL;
+	up_write(&vma_lock->rw_sema);
+	kref_put(&vma_lock->refs, hugetlb_vma_lock_release);
+}
+
+static void __hugetlb_vma_unlock_write_free(struct vm_area_struct *vma)
+{
+	if (__vma_shareable_lock(vma)) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		__hugetlb_vma_unlock_write_put(vma_lock);
+	}
+}
+
+static void hugetlb_vma_lock_free(struct vm_area_struct *vma)
+{
+	/*
+	 * Only present in sharable vmas.
+	 */
+	if (!vma || !__vma_shareable_lock(vma))
+		return;
+
+	if (vma->vm_private_data) {
+		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
+
+		down_write(&vma_lock->rw_sema);
+		__hugetlb_vma_unlock_write_put(vma_lock);
+	}
+}
+
+static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma)
+{
+	struct hugetlb_vma_lock *vma_lock;
+
+	/* Only establish in (flags) sharable vmas */
+	if (!vma || !(vma->vm_flags & VM_MAYSHARE))
+		return;
+
+	/* Should never get here with non-NULL vm_private_data */
+	if (vma->vm_private_data)
+		return;
+
+	vma_lock = kmalloc(sizeof(*vma_lock), GFP_KERNEL);
+	if (!vma_lock) {
+		/*
+		 * If we can not allocate structure, then vma can not
+		 * participate in pmd sharing.  This is only a possible
+		 * performance enhancement and memory saving issue.
+		 * However, the lock is also used to synchronize page
+		 * faults with truncation.  If the lock is not present,
+		 * unlikely races could leave pages in a file past i_size
+		 * until the file is removed.  Warn in the unlikely case of
+		 * allocation failure.
+		 */
+		pr_warn_once("HugeTLB: unable to allocate vma specific lock\n");
+		return;
+	}
+
+	kref_init(&vma_lock->refs);
+	init_rwsem(&vma_lock->rw_sema);
+	vma_lock->vma = vma;
+	vma->vm_private_data = vma_lock;
+}
+
 /* Helper that removes a struct file_region from the resv_map cache and returns
  * it for use.
  */
@@ -1345,7 +1491,7 @@ static void __destroy_compound_gigantic_folio(struct folio *folio,
 	}
 
 	folio_set_compound_order(folio, 0);
-	folio_clear_head(folio);
+	__folio_clear_head(folio);
 }
 
 static void destroy_compound_hugetlb_folio_for_demote(struct folio *folio,
@@ -1381,13 +1527,13 @@ static void free_gigantic_folio(struct folio *folio, unsigned int order)
 static struct folio *alloc_gigantic_folio(struct hstate *h, gfp_t gfp_mask,
 		int nid, nodemask_t *nodemask)
 {
+	struct page *page;
 	unsigned long nr_pages = pages_per_huge_page(h);
 	if (nid == NUMA_NO_NODE)
 		nid = numa_mem_id();
 
 #ifdef CONFIG_CMA
 	{
-		struct page *page;
 		int node;
 
 		if (hugetlb_cma[nid]) {
@@ -1410,7 +1556,9 @@ static struct folio *alloc_gigantic_folio(struct hstate *h, gfp_t gfp_mask,
 		}
 	}
 #endif
-	return page_folio(alloc_contig_pages(nr_pages, gfp_mask, nid, nodemask));
+
+	page = alloc_contig_pages(nr_pages, gfp_mask, nid, nodemask);
+	return page ? page_folio(page) : NULL;
 }
 
 #else /* !CONFIG_CONTIG_ALLOC */
@@ -1528,10 +1676,10 @@ static void add_hugetlb_folio(struct hstate *h, struct folio *folio,
 	}
 
 	folio_set_compound_dtor(folio, HUGETLB_PAGE_DTOR);
-	folio_change_private(folio, 0);
+	folio_change_private(folio, NULL);
 	/*
-	 * We have to set HPageVmemmapOptimized again as above
-	 * folio_change_private(folio, 0) cleared it.
+	 * We have to set hugetlb_vmemmap_optimized again as above
+	 * folio_change_private(folio, NULL) cleared it.
 	 */
 	folio_set_hugetlb_vmemmap_optimized(folio);
 
@@ -1803,9 +1951,10 @@ static bool __prep_compound_gigantic_folio(struct folio *folio,
 	int nr_pages = 1 << order;
 	struct page *p;
 
+	__folio_clear_reserved(folio);
+	__folio_set_head(folio);
 	/* we rely on prep_new_hugetlb_folio to set the destructor */
 	folio_set_compound_order(folio, order);
-	__SetPageHead(&folio->page);
 	for (i = 0; i < nr_pages; i++) {
 		p = folio_page(folio, i);
 
@@ -1821,7 +1970,8 @@ static bool __prep_compound_gigantic_folio(struct folio *folio,
 		 * on the head page when they need know if put_page() is needed
 		 * after get_user_pages().
 		 */
-		__ClearPageReserved(p);
+		if (i != 0)	/* head page cleared above */
+			__ClearPageReserved(p);
 		/*
 		 * Subtle and very unlikely
 		 *
@@ -1869,7 +2019,7 @@ out_error:
 		__ClearPageReserved(p);
 	}
 	folio_set_compound_order(folio, 0);
-	folio_clear_head(folio);
+	__folio_clear_head(folio);
 	return false;
 }
 
@@ -1985,11 +2135,6 @@ retry:
 		page = NULL;
 	}
 
-	if (page)
-		__count_vm_event(HTLB_BUDDY_PGALLOC);
-	else
-		__count_vm_event(HTLB_BUDDY_PGALLOC_FAIL);
-
 	/*
 	 * If we did not specify __GFP_RETRY_MAYFAIL, but still got a page this
 	 * indicates an overall state change.  Clear bit so that we resume
@@ -2006,6 +2151,12 @@ retry:
 	if (node_alloc_noretry && !page && alloc_try_hard)
 		node_set(nid, *node_alloc_noretry);
 
+	if (!page) {
+		__count_vm_event(HTLB_BUDDY_PGALLOC_FAIL);
+		return NULL;
+	}
+
+	__count_vm_event(HTLB_BUDDY_PGALLOC);
 	return page_folio(page);
 }
 
@@ -2064,16 +2215,13 @@ static int alloc_pool_huge_page(struct hstate *h, nodemask_t *nodes_allowed,
 	for_each_node_mask_to_alloc(h, nr_nodes, node, nodes_allowed) {
 		folio = alloc_fresh_hugetlb_folio(h, gfp_mask, node,
 					nodes_allowed, node_alloc_noretry);
-		if (folio)
-			break;
+		if (folio) {
+			free_huge_page(&folio->page); /* free it into the hugepage allocator */
+			return 1;
+		}
 	}
 
-	if (!folio)
-		return 0;
-
-	free_huge_page(&folio->page); /* free it into the hugepage allocator */
-
-	return 1;
+	return 0;
 }
 
 /*
@@ -2742,7 +2890,7 @@ void restore_reserve_on_error(struct hstate *h, struct vm_area_struct *vma,
  * alloc_and_dissolve_hugetlb_folio - Allocate a new folio and dissolve
  * the old one
  * @h: struct hstate old page belongs to
- * @old_page: Old page to dissolve
+ * @old_folio: Old folio to dissolve
  * @list: List to isolate the page in case we need to
  * Returns 0 on success, otherwise negated error.
  */
@@ -2755,8 +2903,8 @@ static int alloc_and_dissolve_hugetlb_folio(struct hstate *h,
 	int ret = 0;
 
 	/*
-	 * Before dissolving the page, we need to allocate a new one for the
-	 * pool to remain stable.  Here, we allocate the page and 'prep' it
+	 * Before dissolving the folio, we need to allocate a new one for the
+	 * pool to remain stable.  Here, we allocate the folio and 'prep' it
 	 * by doing everything but actually updating counters and adding to
 	 * the pool.  This simplifies and let us do most of the processing
 	 * under the lock.
@@ -2784,7 +2932,7 @@ retry:
 		goto free_new;
 	} else if (!folio_test_hugetlb_freed(old_folio)) {
 		/*
-		 * Page's refcount is 0 but it has not been enqueued in the
+		 * Folio's refcount is 0 but it has not been enqueued in the
 		 * freelist yet. Race window is small, so we can succeed here if
 		 * we retry.
 		 */
@@ -2793,7 +2941,7 @@ retry:
 		goto retry;
 	} else {
 		/*
-		 * Ok, old_page is still a genuine free hugepage. Remove it from
+		 * Ok, old_folio is still a genuine free hugepage. Remove it from
 		 * the freelist and decrease the counters. These will be
 		 * incremented again when calling __prep_account_new_huge_page()
 		 * and enqueue_hugetlb_folio() for new_folio. The counters will
@@ -2802,14 +2950,14 @@ retry:
 		remove_hugetlb_folio(h, old_folio, false);
 
 		/*
-		 * Ref count on new page is already zero as it was dropped
+		 * Ref count on new_folio is already zero as it was dropped
 		 * earlier.  It can be directly added to the pool free list.
 		 */
 		__prep_account_new_huge_page(h, nid);
 		enqueue_hugetlb_folio(h, new_folio);
 
 		/*
-		 * Pages have been replaced, we can safely free the old one.
+		 * Folio has been replaced, we can safely free the old one.
 		 */
 		spin_unlock_irq(&hugetlb_lock);
 		update_and_free_hugetlb_folio(h, old_folio, false);
@@ -2819,7 +2967,7 @@ retry:
 
 free_new:
 	spin_unlock_irq(&hugetlb_lock);
-	/* Page has a zero ref count, but needs a ref to be freed */
+	/* Folio has a zero ref count, but needs a ref to be freed */
 	folio_ref_unfreeze(new_folio, 1);
 	update_and_free_hugetlb_folio(h, new_folio, false);
 
@@ -6345,9 +6493,12 @@ long follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
 				fault_flags |= FAULT_FLAG_WRITE;
 			else if (unshare)
 				fault_flags |= FAULT_FLAG_UNSHARE;
-			if (locked)
+			if (locked) {
 				fault_flags |= FAULT_FLAG_ALLOW_RETRY |
 					FAULT_FLAG_KILLABLE;
+				if (flags & FOLL_INTERRUPTIBLE)
+					fault_flags |= FAULT_FLAG_INTERRUPTIBLE;
+			}
 			if (flags & FOLL_NOWAIT)
 				fault_flags |= FAULT_FLAG_ALLOW_RETRY |
 					FAULT_FLAG_RETRY_NOWAIT;
@@ -6608,7 +6759,8 @@ bool hugetlb_reserve_pages(struct inode *inode,
 	}
 
 	/*
-	 * vma specific semaphore used for pmd sharing synchronization
+	 * vma specific semaphore used for pmd sharing and fault/truncation
+	 * synchronization
 	 */
 	hugetlb_vma_lock_alloc(vma);
 
@@ -6864,149 +7016,6 @@ void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
 		*end = ALIGN(*end, PUD_SIZE);
 }
 
-static bool __vma_shareable_flags_pmd(struct vm_area_struct *vma)
-{
-	return vma->vm_flags & (VM_MAYSHARE | VM_SHARED) &&
-		vma->vm_private_data;
-}
-
-void hugetlb_vma_lock_read(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		down_read(&vma_lock->rw_sema);
-	}
-}
-
-void hugetlb_vma_unlock_read(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		up_read(&vma_lock->rw_sema);
-	}
-}
-
-void hugetlb_vma_lock_write(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		down_write(&vma_lock->rw_sema);
-	}
-}
-
-void hugetlb_vma_unlock_write(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		up_write(&vma_lock->rw_sema);
-	}
-}
-
-int hugetlb_vma_trylock_write(struct vm_area_struct *vma)
-{
-	struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-	if (!__vma_shareable_flags_pmd(vma))
-		return 1;
-
-	return down_write_trylock(&vma_lock->rw_sema);
-}
-
-void hugetlb_vma_assert_locked(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		lockdep_assert_held(&vma_lock->rw_sema);
-	}
-}
-
-void hugetlb_vma_lock_release(struct kref *kref)
-{
-	struct hugetlb_vma_lock *vma_lock = container_of(kref,
-			struct hugetlb_vma_lock, refs);
-
-	kfree(vma_lock);
-}
-
-static void __hugetlb_vma_unlock_write_put(struct hugetlb_vma_lock *vma_lock)
-{
-	struct vm_area_struct *vma = vma_lock->vma;
-
-	/*
-	 * vma_lock structure may or not be released as a result of put,
-	 * it certainly will no longer be attached to vma so clear pointer.
-	 * Semaphore synchronizes access to vma_lock->vma field.
-	 */
-	vma_lock->vma = NULL;
-	vma->vm_private_data = NULL;
-	up_write(&vma_lock->rw_sema);
-	kref_put(&vma_lock->refs, hugetlb_vma_lock_release);
-}
-
-static void __hugetlb_vma_unlock_write_free(struct vm_area_struct *vma)
-{
-	if (__vma_shareable_flags_pmd(vma)) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		__hugetlb_vma_unlock_write_put(vma_lock);
-	}
-}
-
-static void hugetlb_vma_lock_free(struct vm_area_struct *vma)
-{
-	/*
-	 * Only present in sharable vmas.
-	 */
-	if (!vma || !__vma_shareable_flags_pmd(vma))
-		return;
-
-	if (vma->vm_private_data) {
-		struct hugetlb_vma_lock *vma_lock = vma->vm_private_data;
-
-		down_write(&vma_lock->rw_sema);
-		__hugetlb_vma_unlock_write_put(vma_lock);
-	}
-}
-
-static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma)
-{
-	struct hugetlb_vma_lock *vma_lock;
-
-	/* Only establish in (flags) sharable vmas */
-	if (!vma || !(vma->vm_flags & VM_MAYSHARE))
-		return;
-
-	/* Should never get here with non-NULL vm_private_data */
-	if (vma->vm_private_data)
-		return;
-
-	vma_lock = kmalloc(sizeof(*vma_lock), GFP_KERNEL);
-	if (!vma_lock) {
-		/*
-		 * If we can not allocate structure, then vma can not
-		 * participate in pmd sharing.  This is only a possible
-		 * performance enhancement and memory saving issue.
-		 * However, the lock is also used to synchronize page
-		 * faults with truncation.  If the lock is not present,
-		 * unlikely races could leave pages in a file past i_size
-		 * until the file is removed.  Warn in the unlikely case of
-		 * allocation failure.
-		 */
-		pr_warn_once("HugeTLB: unable to allocate vma specific lock\n");
-		return;
-	}
-
-	kref_init(&vma_lock->refs);
-	init_rwsem(&vma_lock->rw_sema);
-	vma_lock->vma = vma;
-	vma->vm_private_data = vma_lock;
-}
-
 /*
  * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
  * and returns the corresponding pte. While this is not necessary for the
@@ -7094,47 +7103,6 @@ int huge_pmd_unshare(struct mm_struct *mm, struct vm_area_struct *vma,
 }
 
 #else /* !CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
-
-void hugetlb_vma_lock_read(struct vm_area_struct *vma)
-{
-}
-
-void hugetlb_vma_unlock_read(struct vm_area_struct *vma)
-{
-}
-
-void hugetlb_vma_lock_write(struct vm_area_struct *vma)
-{
-}
-
-void hugetlb_vma_unlock_write(struct vm_area_struct *vma)
-{
-}
-
-int hugetlb_vma_trylock_write(struct vm_area_struct *vma)
-{
-	return 1;
-}
-
-void hugetlb_vma_assert_locked(struct vm_area_struct *vma)
-{
-}
-
-void hugetlb_vma_lock_release(struct kref *kref)
-{
-}
-
-static void __hugetlb_vma_unlock_write_free(struct vm_area_struct *vma)
-{
-}
-
-static void hugetlb_vma_lock_free(struct vm_area_struct *vma)
-{
-}
-
-static void hugetlb_vma_lock_alloc(struct vm_area_struct *vma)
-{
-}
 
 pte_t *huge_pmd_share(struct mm_struct *mm, struct vm_area_struct *vma,
 		      unsigned long addr, pud_t *pud)

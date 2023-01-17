@@ -6,7 +6,6 @@
 #include <linux/bug.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
-#include <linux/once.h>
 
 #include <uapi/linux/random.h>
 
@@ -120,6 +119,7 @@ void __init random_init_early(const char *command_line);
 void __init random_init(void);
 bool rng_is_initialized(void);
 int wait_for_random_bytes(void);
+int execute_with_initialized_rng(struct notifier_block *nb);
 
 /* Calls wait_for_random_bytes() and then calls get_random_bytes(buf, nbytes).
  * Returns the result of the call to wait_for_random_bytes. */
@@ -151,8 +151,6 @@ declare_get_random_var_wait(long, unsigned long)
  * for legacy reasons.
  */
 #include <linux/prandom.h>
-
-#include <asm/archrandom.h>
 
 #ifdef CONFIG_SMP
 int random_prepare_cpu(unsigned int cpu);

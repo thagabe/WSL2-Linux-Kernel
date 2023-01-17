@@ -19,6 +19,7 @@
 #include "accessors.h"
 #include "extent-tree.h"
 #include "relocation.h"
+#include "tree-checker.h"
 
 /* Just arbitrary numbers so we can be sure one of these happened. */
 #define BACKREF_FOUND_SHARED     6
@@ -483,6 +484,7 @@ static int add_all_parents(struct btrfs_backref_walk_ctx *ctx,
 	u64 wanted_disk_byte = ref->wanted_disk_byte;
 	u64 count = 0;
 	u64 data_offset;
+	u8 type;
 
 	if (level != 0) {
 		eb = path->nodes[level];
@@ -537,6 +539,9 @@ static int add_all_parents(struct btrfs_backref_walk_ctx *ctx,
 			continue;
 		}
 		fi = btrfs_item_ptr(eb, slot, struct btrfs_file_extent_item);
+		type = btrfs_file_extent_type(eb, fi);
+		if (type == BTRFS_FILE_EXTENT_INLINE)
+			goto next;
 		disk_byte = btrfs_file_extent_disk_bytenr(eb, fi);
 		data_offset = btrfs_file_extent_offset(eb, fi);
 

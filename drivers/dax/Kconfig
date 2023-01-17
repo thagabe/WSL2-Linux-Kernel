@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 menuconfig DAX
-	bool "DAX: direct access to differentiated memory"
-	depends on MMU
+	tristate "DAX: direct access to differentiated memory"
 	select SRCU
+	default m if NVDIMM_DAX
 
 if DAX
 
 config DEV_DAX
 	tristate "Device DAX: direct access mapping device"
 	depends on TRANSPARENT_HUGEPAGE
-	depends on !FS_DAX_LIMITED
 	help
 	  Support raw access to differentiated (persistence, bandwidth,
 	  latency...) memory via an mmap(2) capable character

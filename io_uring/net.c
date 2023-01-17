@@ -67,7 +67,18 @@ struct io_sr_msg {
 	struct io_kiocb 		*notif;
 };
 
-#define IO_APOLL_MULTI_POLLED (REQ_F_APOLL_MULTISHOT | REQ_F_POLLED)
+static inline bool io_check_multishot(struct io_kiocb *req,
+				      unsigned int issue_flags)
+{
+	/*
+	 * When ->locked_cq is set we only allow to post CQEs from the original
+	 * task context. Usual request completions will be handled in other
+	 * generic paths but multipoll may decide to post extra cqes.
+	 */
+	return !(issue_flags & IO_URING_F_IOWQ) ||
+		!(issue_flags & IO_URING_F_MULTISHOT) ||
+		!req->ctx->task_complete;
+}
 
 int io_shutdown_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 {
@@ -367,7 +378,7 @@ int io_send(struct io_kiocb *req, unsigned int issue_flags)
 	if (unlikely(!sock))
 		return -ENOTSOCK;
 
-	ret = import_single_range(WRITE, sr->buf, sr->len, &iov, &msg.msg_iter);
+	ret = import_single_range(ITER_SOURCE, sr->buf, sr->len, &iov, &msg.msg_iter);
 	if (unlikely(ret))
 		return ret;
 
@@ -453,7 +464,7 @@ static int __io_recvmsg_copy_hdr(struct io_kiocb *req,
 		}
 	} else {
 		iomsg->free_iov = iomsg->fast_iov;
-		ret = __import_iovec(READ, msg.msg_iov, msg.msg_iovlen, UIO_FASTIOV,
+		ret = __import_iovec(ITER_DEST, msg.msg_iov, msg.msg_iovlen, UIO_FASTIOV,
 				     &iomsg->free_iov, &iomsg->msg.msg_iter,
 				     false);
 		if (ret > 0)
@@ -483,6 +494,7 @@ static int __io_compat_recvmsg_copy_hdr(struct io_kiocb *req,
 	if (req->flags & REQ_F_BUFFER_SELECT) {
 		compat_ssize_t clen;
 
+		iomsg->free_iov = NULL;
 		if (msg.msg_iovlen == 0) {
 			sr->len = 0;
 		} else if (msg.msg_iovlen > 1) {
@@ -505,7 +517,7 @@ static int __io_compat_recvmsg_copy_hdr(struct io_kiocb *req,
 		}
 	} else {
 		iomsg->free_iov = iomsg->fast_iov;
-		ret = __import_iovec(READ, (struct iovec __user *)uiov, msg.msg_iovlen,
+		ret = __import_iovec(ITER_DEST, (struct iovec __user *)uiov, msg.msg_iovlen,
 				   UIO_FASTIOV, &iomsg->free_iov,
 				   &iomsg->msg.msg_iter, true);
 		if (ret < 0)
@@ -593,7 +605,8 @@ static inline void io_recv_prep_retry(struct io_kiocb *req)
  * again (for multishot).
  */
 static inline bool io_recv_finish(struct io_kiocb *req, int *ret,
-				  unsigned int cflags, bool mshot_finished)
+				  unsigned int cflags, bool mshot_finished,
+				  unsigned issue_flags)
 {
 	if (!(req->flags & REQ_F_APOLL_MULTISHOT)) {
 		io_req_set_res(req, *ret, cflags);
@@ -602,8 +615,8 @@ static inline bool io_recv_finish(struct io_kiocb *req, int *ret,
 	}
 
 	if (!mshot_finished) {
-		if (io_post_aux_cqe(req->ctx, req->cqe.user_data, *ret,
-				    cflags | IORING_CQE_F_MORE)) {
+		if (io_aux_cqe(req->ctx, issue_flags & IO_URING_F_COMPLETE_DEFER,
+			       req->cqe.user_data, *ret, cflags | IORING_CQE_F_MORE, true)) {
 			io_recv_prep_retry(req);
 			return false;
 		}
@@ -612,7 +625,7 @@ static inline bool io_recv_finish(struct io_kiocb *req, int *ret,
 
 	io_req_set_res(req, *ret, cflags);
 
-	if (req->flags & REQ_F_POLLED)
+	if (issue_flags & IO_URING_F_MULTISHOT)
 		*ret = IOU_STOP_MULTISHOT;
 	else
 		*ret = IOU_OK;
@@ -731,6 +744,9 @@ int io_recvmsg(struct io_kiocb *req, unsigned int issue_flags)
 	    (sr->flags & IORING_RECVSEND_POLL_FIRST))
 		return io_setup_async_msg(req, kmsg, issue_flags);
 
+	if (!io_check_multishot(req, issue_flags))
+		return io_setup_async_msg(req, kmsg, issue_flags);
+
 retry_multishot:
 	if (io_do_buffer_select(req)) {
 		void __user *buf;
@@ -750,7 +766,7 @@ retry_multishot:
 
 		kmsg->fast_iov[0].iov_base = buf;
 		kmsg->fast_iov[0].iov_len = len;
-		iov_iter_init(&kmsg->msg.msg_iter, READ, kmsg->fast_iov, 1,
+		iov_iter_init(&kmsg->msg.msg_iter, ITER_DEST, kmsg->fast_iov, 1,
 				len);
 	}
 
@@ -771,8 +787,7 @@ retry_multishot:
 	if (ret < min_ret) {
 		if (ret == -EAGAIN && force_nonblock) {
 			ret = io_setup_async_msg(req, kmsg, issue_flags);
-			if (ret == -EAGAIN && (req->flags & IO_APOLL_MULTI_POLLED) ==
-					       IO_APOLL_MULTI_POLLED) {
+			if (ret == -EAGAIN && (issue_flags & IO_URING_F_MULTISHOT)) {
 				io_kbuf_recycle(req, issue_flags);
 				return IOU_ISSUE_SKIP_COMPLETE;
 			}
@@ -801,14 +816,14 @@ retry_multishot:
 	if (kmsg->msg.msg_inq)
 		cflags |= IORING_CQE_F_SOCK_NONEMPTY;
 
-	if (!io_recv_finish(req, &ret, cflags, mshot_finished))
+	if (!io_recv_finish(req, &ret, cflags, mshot_finished, issue_flags))
 		goto retry_multishot;
 
 	if (mshot_finished) {
-		io_netmsg_recycle(req, issue_flags);
 		/* fast path, check for non-NULL to avoid function call */
 		if (kmsg->free_iov)
 			kfree(kmsg->free_iov);
+		io_netmsg_recycle(req, issue_flags);
 		req->flags &= ~REQ_F_NEED_CLEANUP;
 	}
 
@@ -831,6 +846,9 @@ int io_recv(struct io_kiocb *req, unsigned int issue_flags)
 	    (sr->flags & IORING_RECVSEND_POLL_FIRST))
 		return -EAGAIN;
 
+	if (!io_check_multishot(req, issue_flags))
+		return -EAGAIN;
+
 	sock = sock_from_file(req->file);
 	if (unlikely(!sock))
 		return -ENOTSOCK;
@@ -845,7 +863,7 @@ retry_multishot:
 		sr->buf = buf;
 	}
 
-	ret = import_single_range(READ, sr->buf, len, &iov, &msg.msg_iter);
+	ret = import_single_range(ITER_DEST, sr->buf, len, &iov, &msg.msg_iter);
 	if (unlikely(ret))
 		goto out_free;
 
@@ -867,7 +885,7 @@ retry_multishot:
 	ret = sock_recvmsg(sock, &msg, flags);
 	if (ret < min_ret) {
 		if (ret == -EAGAIN && force_nonblock) {
-			if ((req->flags & IO_APOLL_MULTI_POLLED) == IO_APOLL_MULTI_POLLED) {
+			if (issue_flags & IO_URING_F_MULTISHOT) {
 				io_kbuf_recycle(req, issue_flags);
 				return IOU_ISSUE_SKIP_COMPLETE;
 			}
@@ -900,7 +918,7 @@ out_free:
 	if (msg.msg_inq)
 		cflags |= IORING_CQE_F_SOCK_NONEMPTY;
 
-	if (!io_recv_finish(req, &ret, cflags, ret <= 0))
+	if (!io_recv_finish(req, &ret, cflags, ret <= 0, issue_flags))
 		goto retry_multishot;
 
 	return ret;
@@ -1091,14 +1109,14 @@ int io_send_zc(struct io_kiocb *req, unsigned int issue_flags)
 		return io_setup_async_addr(req, &__address, issue_flags);
 
 	if (zc->flags & IORING_RECVSEND_FIXED_BUF) {
-		ret = io_import_fixed(WRITE, &msg.msg_iter, req->imu,
+		ret = io_import_fixed(ITER_SOURCE, &msg.msg_iter, req->imu,
 					(u64)(uintptr_t)zc->buf, zc->len);
 		if (unlikely(ret))
 			return ret;
 		msg.sg_from_iter = io_sg_from_iter;
 	} else {
 		io_notif_set_extended(zc->notif);
-		ret = import_single_range(WRITE, zc->buf, zc->len, &iov,
+		ret = import_single_range(ITER_SOURCE, zc->buf, zc->len, &iov,
 					  &msg.msg_iter);
 		if (unlikely(ret))
 			return ret;
@@ -1282,6 +1300,8 @@ int io_accept(struct io_kiocb *req, unsigned int issue_flags)
 	struct file *file;
 	int ret, fd;
 
+	if (!io_check_multishot(req, issue_flags))
+		return -EAGAIN;
 retry:
 	if (!fixed) {
 		fd = __get_unused_fd_flags(accept->flags, accept->nofile);
@@ -1300,8 +1320,7 @@ retry:
 			 * return EAGAIN to arm the poll infra since it
 			 * has already been done
 			 */
-			if ((req->flags & IO_APOLL_MULTI_POLLED) ==
-			    IO_APOLL_MULTI_POLLED)
+			if (issue_flags & IO_URING_F_MULTISHOT)
 				ret = IOU_ISSUE_SKIP_COMPLETE;
 			return ret;
 		}
@@ -1323,8 +1342,10 @@ retry:
 
 	if (ret < 0)
 		return ret;
-	if (io_post_aux_cqe(ctx, req->cqe.user_data, ret, IORING_CQE_F_MORE))
+	if (io_aux_cqe(ctx, issue_flags & IO_URING_F_COMPLETE_DEFER,
+		       req->cqe.user_data, ret, IORING_CQE_F_MORE, true))
 		goto retry;
+
 	return -ECANCELED;
 }
 

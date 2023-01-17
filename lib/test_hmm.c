@@ -605,11 +605,8 @@ err_devmem:
 
 static struct page *dmirror_devmem_alloc_page(struct dmirror_device *mdevice)
 {
-	struct dev_pagemap *pgmap;
 	struct page *dpage = NULL;
 	struct page *rpage = NULL;
-	struct folio *folio;
-	unsigned long pfn;
 
 	/*
 	 * For ZONE_DEVICE private type, this is a fake device so we allocate
@@ -635,12 +632,7 @@ static struct page *dmirror_devmem_alloc_page(struct dmirror_device *mdevice)
 			goto error;
 	}
 
-	/* FIXME: Rework allocator to be pgmap offset based */
-	pgmap = dpage->pgmap;
-	pfn = page_to_pfn(dpage);
-	folio = pgmap_request_folio(pgmap, pfn_to_pgmap_offset(pgmap, pfn), 0);
-	WARN_ON_ONCE(dpage != &folio->page);
-	lock_page(dpage);
+	zone_device_page_init(dpage);
 	dpage->zone_device_data = rpage;
 	return dpage;
 

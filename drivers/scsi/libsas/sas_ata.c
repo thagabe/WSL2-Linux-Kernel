@@ -287,6 +287,31 @@ static int sas_ata_clear_pending(struct domain_device *dev, struct ex_phy *phy)
 		return 1;
 }
 
+int smp_ata_check_ready_type(struct ata_link *link)
+{
+	struct domain_device *dev = link->ap->private_data;
+	struct sas_phy *phy = sas_get_local_phy(dev);
+	struct domain_device *ex_dev = dev->parent;
+	enum sas_device_type type = SAS_PHY_UNUSED;
+	u8 sas_addr[SAS_ADDR_SIZE];
+	int res;
+
+	res = sas_get_phy_attached_dev(ex_dev, phy->number, sas_addr, &type);
+	sas_put_local_phy(phy);
+	if (res)
+		return res;
+
+	switch (type) {
+	case SAS_SATA_PENDING:
+		return 0;
+	case SAS_END_DEVICE:
+		return 1;
+	default:
+		return -ENODEV;
+	}
+}
+EXPORT_SYMBOL_GPL(smp_ata_check_ready_type);
+
 static int smp_ata_check_ready(struct ata_link *link)
 {
 	int res;
@@ -358,7 +383,7 @@ static int sas_ata_printk(const char *level, const struct domain_device *ddev,
 	return r;
 }
 
-int sas_ata_wait_after_reset(struct domain_device *dev, unsigned long deadline)
+static int sas_ata_wait_after_reset(struct domain_device *dev, unsigned long deadline)
 {
 	struct sata_device *sata_dev = &dev->sata_dev;
 	int (*check_ready)(struct ata_link *link);
@@ -380,7 +405,6 @@ int sas_ata_wait_after_reset(struct domain_device *dev, unsigned long deadline)
 
 	return ret;
 }
-EXPORT_SYMBOL_GPL(sas_ata_wait_after_reset);
 
 static int sas_ata_hard_reset(struct ata_link *link, unsigned int *class,
 			      unsigned long deadline)
@@ -865,7 +889,9 @@ void sas_ata_device_link_abort(struct domain_device *device, bool force_reset)
 {
 	struct ata_port *ap = device->sata_dev.ap;
 	struct ata_link *link = &ap->link;
+	unsigned long flags;
 
+	spin_lock_irqsave(ap->lock, flags);
 	device->sata_dev.fis[2] = ATA_ERR | ATA_DRDY; /* tf status */
 	device->sata_dev.fis[3] = ATA_ABORTED; /* tf error */
 
@@ -873,6 +899,7 @@ void sas_ata_device_link_abort(struct domain_device *device, bool force_reset)
 	if (force_reset)
 		link->eh_info.action |= ATA_EH_RESET;
 	ata_link_abort(link);
+	spin_unlock_irqrestore(ap->lock, flags);
 }
 EXPORT_SYMBOL_GPL(sas_ata_device_link_abort);
 

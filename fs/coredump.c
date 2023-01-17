@@ -532,7 +532,6 @@ void do_coredump(const kernel_siginfo_t *siginfo)
 	static atomic_t core_dump_count = ATOMIC_INIT(0);
 	struct coredump_params cprm = {
 		.siginfo = siginfo,
-		.regs = signal_pt_regs(),
 		.limit = rlimit(RLIMIT_CORE),
 		/*
 		 * We must use the same mm->flags while dumping core to avoid
@@ -861,7 +860,7 @@ static int dump_emit_page(struct coredump_params *cprm, struct page *page)
 	if (dump_interrupted())
 		return 0;
 	pos = file->f_pos;
-	iov_iter_bvec(&iter, WRITE, &bvec, 1, PAGE_SIZE);
+	iov_iter_bvec(&iter, ITER_SOURCE, &bvec, 1, PAGE_SIZE);
 	n = __kernel_write_iter(cprm->file, &iter, &pos);
 	if (n != PAGE_SIZE)
 		return 0;

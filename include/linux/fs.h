@@ -1119,6 +1119,9 @@ struct file_lock {
 			int state;		/* state of grant or error if -ve */
 			unsigned int	debug_id;
 		} afs;
+		struct {
+			struct inode *inode;
+		} ceph;
 	} fl_u;
 } __randomize_layout;
 
@@ -1131,9 +1134,8 @@ struct file_lock_context {
 
 /* The following constant reflects the upper bound of the file/locking space */
 #ifndef OFFSET_MAX
-#define INT_LIMIT(x)	(~((x)1 << (sizeof(x)*8 - 1)))
-#define OFFSET_MAX	INT_LIMIT(loff_t)
-#define OFFT_OFFSET_MAX	INT_LIMIT(off_t)
+#define OFFSET_MAX	type_max(loff_t)
+#define OFFT_OFFSET_MAX	type_max(off_t)
 #endif
 
 extern void send_sigio(struct fown_struct *fown, int fd, int band);
@@ -1290,6 +1292,11 @@ static inline int vfs_lock_file(struct file *filp, unsigned int cmd,
 static inline int vfs_cancel_lock(struct file *filp, struct file_lock *fl)
 {
 	return 0;
+}
+
+static inline bool vfs_inode_has_locks(struct inode *inode)
+{
+	return false;
 }
 
 static inline int locks_lock_inode_wait(struct inode *inode, struct file_lock *fl)
@@ -2069,6 +2076,14 @@ struct dir_context {
  * btrfs clone/dedupe ioctls.
  */
 #define REMAP_FILE_ADVISORY		(REMAP_FILE_CAN_SHORTEN)
+
+/*
+ * These flags control the behavior of vfs_copy_file_range().
+ * They are not available to the user via syscall.
+ *
+ * COPY_FILE_SPLICE: call splice direct instead of fs clone/copy ops
+ */
+#define COPY_FILE_SPLICE		(1 << 0)
 
 struct iov_iter;
 struct io_uring_cmd;
@@ -3522,7 +3537,7 @@ int __init list_bdev_fs_names(char *buf, size_t size);
 
 static inline bool is_sxid(umode_t mode)
 {
-	return (mode & S_ISUID) || ((mode & S_ISGID) && (mode & S_IXGRP));
+	return mode & (S_ISUID | S_ISGID);
 }
 
 static inline int check_sticky(struct user_namespace *mnt_userns,
