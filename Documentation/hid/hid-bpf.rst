@@ -307,7 +307,7 @@ sysfs path: ``/sys/bus/hid/devices/xxxx:yyyy:zzzz:0000``)
 
 We can not rely on hidraw to bind a BPF program to a HID device. hidraw is an
 artefact of the processing of the HID device, and is not stable. Some drivers
-even disable it, so that removes the tracing capabilies on those devices
+even disable it, so that removes the tracing capabilities on those devices
 (where it is interesting to get the non-hidraw traces).
 
 On the other hand, the ``hid_id`` is stable for the entire life of the HID device,
@@ -427,11 +427,21 @@ program first::
 	prog_fd = bpf_program__fd(hid_skel->progs.attach_prog);
 
 	err = bpf_prog_test_run_opts(prog_fd, &tattrs);
-	return err;
+	if (err)
+		return err;
+
+	return args.retval; /* the fd of the created bpf_link */
   }
 
 Our userspace program can now listen to notifications on the ring buffer, and
 is awaken only when the value changes.
+
+When the userspace program doesn't need to listen to events anymore, it can just
+close the returned fd from :c:func:`attach_filter`, which will tell the kernel to
+detach the program from the HID device.
+
+Of course, in other use cases, the userspace program can also pin the fd to the
+BPF filesystem through a call to :c:func:`bpf_obj_pin`, as with any bpf_link.
 
 Controlling the device
 ----------------------
