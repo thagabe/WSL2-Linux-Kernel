@@ -11,10 +11,9 @@ C DCL-fixed
 {
 	int flag;
 	int data;
-	int lck;
 }
 
-P0(int *flag, int *data, int *lck)
+P0(int *flag, int *data, spinlock_t *lck)
 {
 	int r0;
 	int r1;
@@ -33,7 +32,7 @@ P0(int *flag, int *data, int *lck)
 	r2 = READ_ONCE(*data);
 }
 
-P1(int *flag, int *data, int *lck)
+P1(int *flag, int *data, spinlock_t *lck)
 {
 	int r0;
 	int r1;
@@ -52,5 +51,5 @@ P1(int *flag, int *data, int *lck)
 	r2 = READ_ONCE(*data);
 }
 
-locations [flag;data;lck;0:r0;0:r1;1:r0;1:r1]
+locations [flag;data;0:r0;0:r1;1:r0;1:r1]
 exists (0:r2=0 \/ 1:r2=0)
