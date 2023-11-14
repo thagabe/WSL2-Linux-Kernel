@@ -2,47 +2,66 @@
 
 /*
  * Test module for lockless object pool
- * (C) 2022 Matt Wu <wuqiang.matt@bytedance.com>
+ *
+ * Copyright: wuqiang.matt@bytedance.com
  */
 
-#include <linux/version.h>
 #include <linux/errno.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/sched.h>
-#include <linux/cpumask.h>
 #include <linux/completion.h>
 #include <linux/kthread.h>
-#include <linux/cpu.h>
-#include <linux/cpuset.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/hrtimer.h>
-#include <linux/interrupt.h>
 #include <linux/objpool.h>
 
 #define OT_NR_MAX_BULK (16)
 
-struct ot_ctrl {
-	unsigned int mode; /* test no */
-	unsigned int objsz; /* object size */
-	unsigned int duration; /* ms */
-	unsigned int delay; /* ms */
-	unsigned int bulk_normal;
-	unsigned int bulk_irq;
-	unsigned long hrtimer; /* ms */
-	const char *name;
+/* memory usage */
+struct ot_mem_stat {
+	atomic_long_t alloc;
+	atomic_long_t free;
 };
 
-struct ot_stat {
+/* object allocation results */
+struct ot_obj_stat {
 	unsigned long nhits;
 	unsigned long nmiss;
 };
 
+/* control & results per testcase */
+struct ot_data {
+	struct rw_semaphore start;
+	struct completion wait;
+	struct completion rcu;
+	atomic_t nthreads ____cacheline_aligned_in_smp;
+	atomic_t stop ____cacheline_aligned_in_smp;
+	struct ot_mem_stat kmalloc;
+	struct ot_mem_stat vmalloc;
+	struct ot_obj_stat objects;
+	u64    duration;
+};
+
+/* testcase */
+struct ot_test {
+	int async; /* synchronous or asynchronous */
+	int mode; /* only mode 0 supported */
+	int objsz; /* object size */
+	int duration; /* ms */
+	int delay; /* ms */
+	int bulk_normal;
+	int bulk_irq;
+	unsigned long hrtimer; /* ms */
+	const char *name;
+	struct ot_data data;
+};
+
+/* per-cpu worker */
 struct ot_item {
 	struct objpool_head *pool; /* pool head */
-	struct ot_ctrl *ctrl; /* ctrl parameters */
+	struct ot_test *test; /* test parameters */
 
 	void (*worker)(struct ot_item *item, int irq);
 
@@ -54,84 +73,48 @@ struct ot_item {
 	int delay;
 	u32 niters;
 
-	/* results summary */
-	struct ot_stat stat[2]; /* thread and irq */
-
+	/* summary per thread */
+	struct ot_obj_stat stat[2]; /* thread and irq */
 	u64 duration;
 };
-
-struct ot_mem_stat {
-	atomic_long_t alloc;
-	atomic_long_t free;
-};
-
-struct ot_data {
-	struct rw_semaphore start;
-	struct completion wait;
-	struct completion rcu;
-	atomic_t nthreads ____cacheline_aligned_in_smp;
-	atomic_t stop ____cacheline_aligned_in_smp;
-	struct ot_mem_stat kmalloc;
-	struct ot_mem_stat vmalloc;
-} g_ot_data;
 
 /*
  * memory leakage checking
  */
 
-static void *ot_kzalloc(long size)
+static void *ot_kzalloc(struct ot_test *test, long size)
 {
 	void *ptr = kzalloc(size, GFP_KERNEL);
 
 	if (ptr)
-		atomic_long_add(size, &g_ot_data.kmalloc.alloc);
+		atomic_long_add(size, &test->data.kmalloc.alloc);
 	return ptr;
 }
 
-static void ot_kfree(void *ptr, long size)
+static void ot_kfree(struct ot_test *test, void *ptr, long size)
 {
 	if (!ptr)
 		return;
-	atomic_long_add(size, &g_ot_data.kmalloc.free);
+	atomic_long_add(size, &test->data.kmalloc.free);
 	kfree(ptr);
 }
 
-static void *ot_vmalloc(long size)
-{
-	void *ptr = vmalloc(size);
-
-	if (ptr)
-		atomic_long_add(size, &g_ot_data.vmalloc.alloc);
-	return ptr;
-}
-
-static void ot_vfree(void *ptr, long size)
-{
-	if (!ptr)
-		return;
-	atomic_long_add(size, &g_ot_data.vmalloc.free);
-	vfree(ptr);
-}
-
-static void ot_mem_report(struct ot_ctrl *ctrl)
+static void ot_mem_report(struct ot_test *test)
 {
 	long alloc, free;
 
-	pr_info("memory allocation summary for %s\n", ctrl->name);
+	pr_info("memory allocation summary for %s\n", test->name);
 
-	alloc = atomic_long_read(&g_ot_data.kmalloc.alloc);
-	free = atomic_long_read(&g_ot_data.kmalloc.free);
+	alloc = atomic_long_read(&test->data.kmalloc.alloc);
+	free = atomic_long_read(&test->data.kmalloc.free);
 	pr_info("  kmalloc: %lu - %lu = %lu\n", alloc, free, alloc - free);
 
-	alloc = atomic_long_read(&g_ot_data.vmalloc.alloc);
-	free = atomic_long_read(&g_ot_data.vmalloc.free);
+	alloc = atomic_long_read(&test->data.vmalloc.alloc);
+	free = atomic_long_read(&test->data.vmalloc.free);
 	pr_info("  vmalloc: %lu - %lu = %lu\n", alloc, free, alloc - free);
 }
 
-/*
- * general structs & routines
- */
-
+/* user object instance */
 struct ot_node {
 	void *owner;
 	unsigned long data;
@@ -139,12 +122,12 @@ struct ot_node {
 	unsigned long payload[32];
 };
 
+/* user objpool manager */
 struct ot_context {
 	struct objpool_head pool; /* objpool head */
-	struct ot_ctrl *ctrl; /* ctrl parameters */
+	struct ot_test *test; /* test parameters */
 	void *ptr; /* user pool buffer */
 	unsigned long size; /* buffer size */
-	refcount_t refs;
 	struct rcu_head rcu;
 };
 
@@ -161,17 +144,7 @@ static int ot_init_data(struct ot_data *data)
 	return 0;
 }
 
-static void ot_reset_data(struct ot_data *data)
-{
-	reinit_completion(&data->wait);
-	reinit_completion(&data->rcu);
-	atomic_set(&data->nthreads, 1);
-	atomic_set(&data->stop, 0);
-	memset(&data->kmalloc, 0, sizeof(data->kmalloc));
-	memset(&data->vmalloc, 0, sizeof(data->vmalloc));
-}
-
-static int ot_init_node(void *context, void *nod)
+static int ot_init_node(void *nod, void *context)
 {
 	struct ot_context *sop = context;
 	struct ot_node *on = nod;
@@ -183,8 +156,9 @@ static int ot_init_node(void *context, void *nod)
 static enum hrtimer_restart ot_hrtimer_handler(struct hrtimer *hrt)
 {
 	struct ot_item *item = container_of(hrt, struct ot_item, hrtimer);
+	struct ot_test *test = item->test;
 
-	if (atomic_read_acquire(&g_ot_data.stop))
+	if (atomic_read_acquire(&test->data.stop))
 		return HRTIMER_NORESTART;
 
 	/* do bulk-testings for objects pop/push */
@@ -196,14 +170,14 @@ static enum hrtimer_restart ot_hrtimer_handler(struct hrtimer *hrt)
 
 static void ot_start_hrtimer(struct ot_item *item)
 {
-	if (!item->ctrl->hrtimer)
+	if (!item->test->hrtimer)
 		return;
 	hrtimer_start(&item->hrtimer, item->hrtcycle, HRTIMER_MODE_REL);
 }
 
 static void ot_stop_hrtimer(struct ot_item *item)
 {
-	if (!item->ctrl->hrtimer)
+	if (!item->test->hrtimer)
 		return;
 	hrtimer_cancel(&item->hrtimer);
 }
@@ -222,57 +196,56 @@ static int ot_init_hrtimer(struct ot_item *item, unsigned long hrtimer)
 }
 
 static int ot_init_cpu_item(struct ot_item *item,
-			struct ot_ctrl *ctrl,
+			struct ot_test *test,
 			struct objpool_head *pool,
 			void (*worker)(struct ot_item *, int))
 {
 	memset(item, 0, sizeof(*item));
 	item->pool = pool;
-	item->ctrl = ctrl;
+	item->test = test;
 	item->worker = worker;
 
-	item->bulk[0] = ctrl->bulk_normal;
-	item->bulk[1] = ctrl->bulk_irq;
-	item->delay = ctrl->delay;
+	item->bulk[0] = test->bulk_normal;
+	item->bulk[1] = test->bulk_irq;
+	item->delay = test->delay;
 
 	/* initialize hrtimer */
-	ot_init_hrtimer(item, item->ctrl->hrtimer);
+	ot_init_hrtimer(item, item->test->hrtimer);
 	return 0;
 }
 
 static int ot_thread_worker(void *arg)
 {
 	struct ot_item *item = arg;
+	struct ot_test *test = item->test;
 	ktime_t start;
 
-	sched_set_normal(current, 50);
-
-	atomic_inc(&g_ot_data.nthreads);
-	down_read(&g_ot_data.start);
-	up_read(&g_ot_data.start);
+	atomic_inc(&test->data.nthreads);
+	down_read(&test->data.start);
+	up_read(&test->data.start);
 	start = ktime_get();
 	ot_start_hrtimer(item);
 	do {
-		if (atomic_read_acquire(&g_ot_data.stop))
+		if (atomic_read_acquire(&test->data.stop))
 			break;
 		/* do bulk-testings for objects pop/push */
 		item->worker(item, 0);
 	} while (!kthread_should_stop());
 	ot_stop_hrtimer(item);
 	item->duration = (u64) ktime_us_delta(ktime_get(), start);
-	if (atomic_dec_and_test(&g_ot_data.nthreads))
-		complete(&g_ot_data.wait);
+	if (atomic_dec_and_test(&test->data.nthreads))
+		complete(&test->data.wait);
 
 	return 0;
 }
 
-static void ot_perf_report(struct ot_ctrl *ctrl, u64 duration)
+static void ot_perf_report(struct ot_test *test, u64 duration)
 {
-	struct ot_stat total, normal = {0}, irq = {0};
+	struct ot_obj_stat total, normal = {0}, irq = {0};
 	int cpu, nthreads = 0;
 
 	pr_info("\n");
-	pr_info("Testing summary for %s\n", ctrl->name);
+	pr_info("Testing summary for %s\n", test->name);
 
 	for_each_possible_cpu(cpu) {
 		struct ot_item *item = per_cpu_ptr(&ot_pcup_items, cpu);
@@ -299,26 +272,32 @@ static void ot_perf_report(struct ot_ctrl *ctrl, u64 duration)
 	pr_info("ALL: \tnthreads: %d  duration: %lluus\n", nthreads, duration);
 	pr_info("SUM: \t%16lu hits \t%16lu miss\n",
 		total.nhits, total.nmiss);
+
+	test->data.objects = total;
+	test->data.duration = duration;
 }
 
 /*
  * synchronous test cases for objpool manipulation
  */
 
-/* objpool manipulation for synchronous mode 0 (percpu objpool) */
-static struct ot_context *ot_init_sync_m0(struct ot_ctrl *ctrl)
+/* objpool manipulation for synchronous mode (percpu objpool) */
+static struct ot_context *ot_init_sync_m0(struct ot_test *test)
 {
 	struct ot_context *sop = NULL;
 	int max = num_possible_cpus() << 3;
+	gfp_t gfp = GFP_KERNEL;
 
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
+	sop = (struct ot_context *)ot_kzalloc(test, sizeof(*sop));
 	if (!sop)
 		return NULL;
-	sop->ctrl = ctrl;
+	sop->test = test;
+	if (test->objsz < 512)
+		gfp = GFP_ATOMIC;
 
-	if (objpool_init(&sop->pool, max, max, ctrl->objsz,
-			GFP_KERNEL, sop, ot_init_node, NULL)) {
-		ot_kfree(sop, sizeof(*sop));
+	if (objpool_init(&sop->pool, max, test->objsz,
+			 gfp, sop, ot_init_node, NULL)) {
+		ot_kfree(test, sop, sizeof(*sop));
 		return NULL;
 	}
 	WARN_ON(max != sop->pool.nr_objs);
@@ -326,198 +305,17 @@ static struct ot_context *ot_init_sync_m0(struct ot_ctrl *ctrl)
 	return sop;
 }
 
-static void ot_fini_sync_m0(struct ot_context *sop)
+static void ot_fini_sync(struct ot_context *sop)
 {
 	objpool_fini(&sop->pool);
-	ot_kfree(sop, sizeof(*sop));
+	ot_kfree(sop->test, sop, sizeof(*sop));
 }
 
-/* objpool manipulation for synchronous mode 1 (private pool) */
-static struct ot_context *ot_init_sync_m1(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	unsigned long size;
-	int rc, szobj, max = num_possible_cpus() << 3;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	szobj = ALIGN(ctrl->objsz, sizeof(void *));
-	size = szobj * max;
-	sop->ptr = ot_vmalloc(size);
-	sop->size = size;
-	if (!sop->ptr) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-	memset(sop->ptr, 0, size);
-
-	/* create and initialize objpool as empty (no objects) */
-	rc = objpool_init(&sop->pool, 0, max, 0, GFP_KERNEL, sop, NULL, NULL);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	/* populate given buffer to objpool */
-	rc = objpool_populate(&sop->pool, sop->ptr, size,
-		ctrl->objsz, sop, ot_init_node);
-	if (rc) {
-		objpool_fini(&sop->pool);
-		ot_vfree(sop->ptr, size);
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-	WARN_ON((size / szobj) != sop->pool.nr_objs);
-
-	return sop;
-}
-
-static void ot_fini_sync_m1(struct ot_context *sop)
-{
-	objpool_fini(&sop->pool);
-
-	ot_vfree(sop->ptr, sop->size);
-	ot_kfree(sop, sizeof(*sop));
-}
-
-/* objpool manipulation for synchronous mode 2 (private objects) */
-static int ot_objpool_release(void *context, void *ptr, uint32_t flags)
-{
-	struct ot_context *sop = context;
-
-	/* here we need release all user-allocated objects */
-	if ((flags & OBJPOOL_FLAG_NODE) && (flags & OBJPOOL_FLAG_USER)) {
-		struct ot_node *on = ptr;
-		WARN_ON(on->data != 0xDEADBEEF);
-		ot_kfree(on, sop->ctrl->objsz);
-	} else if (flags & OBJPOOL_FLAG_POOL) {
-		/* release user preallocated pool */
-		if (sop->ptr) {
-			WARN_ON(sop->ptr != ptr);
-			WARN_ON(!(flags & OBJPOOL_FLAG_USER));
-			ot_vfree(sop->ptr, sop->size);
-		}
-		/* do context cleaning if needed */
-		ot_kfree(sop, sizeof(*sop));
-	}
-
-	return 0;
-}
-
-static struct ot_context *ot_init_sync_m2(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	struct ot_node *on;
-	int rc, i, max = num_possible_cpus() << 3;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	/* create and initialize objpool as empty (no objects) */
-	rc = objpool_init(&sop->pool, 0, max, 0, GFP_KERNEL, sop, NULL,
-			ot_objpool_release);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	/* allocate private objects and insert to objpool */
-	for (i = 0; i < max; i++) {
-		on = ot_kzalloc(ctrl->objsz);
-		if (on) {
-			ot_init_node(sop, on);
-			on->data = 0xDEADBEEF;
-			objpool_add(on, &sop->pool);
-		}
-	}
-	WARN_ON(max != sop->pool.nr_objs);
-
-	return sop;
-}
-
-static void ot_fini_sync_m2(struct ot_context *sop)
-{
-	objpool_fini(&sop->pool);
-}
-
-/* objpool manipulation for synchronous mode 3 (mixed mode) */
-static struct ot_context *ot_init_sync_m3(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	struct ot_node *on;
-	unsigned long size;
-	int rc, i, szobj, nobjs;
-	int max = num_possible_cpus() << 4;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	/* create and initialize objpool as empty (no objects) */
-	nobjs = num_possible_cpus() * 2;
-	rc = objpool_init(&sop->pool, nobjs, max, ctrl->objsz, GFP_KERNEL,
-			sop, ot_init_node, ot_objpool_release);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	szobj = ALIGN(ctrl->objsz, sizeof(void *));
-	size = szobj * num_possible_cpus() * 4;
-	sop->ptr = ot_vmalloc(size);
-	if (!sop->ptr) {
-		objpool_fini(&sop->pool);
-		return NULL;
-	}
-	sop->size = size;
-	memset(sop->ptr, 0, size);
-
-	/* populate given buffer to objpool */
-	rc = objpool_populate(&sop->pool, sop->ptr, size,
-		ctrl->objsz, sop, ot_init_node);
-	if (rc) {
-		objpool_fini(&sop->pool);
-		ot_vfree(sop->ptr, size);
-		return NULL;
-	}
-	nobjs += size / szobj;
-
-	/* allocate private objects and insert to objpool */
-	for (i = 0; i < num_possible_cpus() * 2; i++) {
-		on = ot_kzalloc(ctrl->objsz);
-		if (on) {
-			ot_init_node(sop, on);
-			on->data = 0xDEADBEEF;
-			if (!objpool_add(on, &sop->pool))
-				nobjs++;
-			else
-				ot_kfree(on, ctrl->objsz);
-		}
-	}
-	WARN_ON(nobjs != sop->pool.nr_objs);
-
-	return sop;
-}
-
-static void ot_fini_sync_m3(struct ot_context *sop)
-{
-	objpool_fini(&sop->pool);
-}
-
-struct {
-	struct ot_context * (*init)(struct ot_ctrl *);
+static struct {
+	struct ot_context * (*init)(struct ot_test *oc);
 	void (*fini)(struct ot_context *sop);
-} g_ot_sync_ops[4] = {
-	{.init = ot_init_sync_m0, .fini = ot_fini_sync_m0},
-	{.init = ot_init_sync_m1, .fini = ot_fini_sync_m1},
-	{.init = ot_init_sync_m2, .fini = ot_fini_sync_m2},
-	{.init = ot_init_sync_m3, .fini = ot_fini_sync_m3},
+} g_ot_sync_ops[] = {
+	{.init = ot_init_sync_m0, .fini = ot_fini_sync},
 };
 
 /*
@@ -547,27 +345,27 @@ static void ot_bulk_sync(struct ot_item *item, int irq)
 	}
 }
 
-static int ot_start_sync(struct ot_ctrl *ctrl)
+static int ot_start_sync(struct ot_test *test)
 {
 	struct ot_context *sop;
 	ktime_t start;
 	u64 duration;
 	unsigned long timeout;
-	int cpu, rc;
+	int cpu;
 
 	/* initialize objpool for syncrhonous testcase */
-	sop = g_ot_sync_ops[ctrl->mode].init(ctrl);
+	sop = g_ot_sync_ops[test->mode].init(test);
 	if (!sop)
 		return -ENOMEM;
 
 	/* grab rwsem to block testing threads */
-	down_write(&g_ot_data.start);
+	down_write(&test->data.start);
 
 	for_each_possible_cpu(cpu) {
 		struct ot_item *item = per_cpu_ptr(&ot_pcup_items, cpu);
 		struct task_struct *work;
 
-		ot_init_cpu_item(item, ctrl, &sop->pool, ot_bulk_sync);
+		ot_init_cpu_item(item, test, &sop->pool, ot_bulk_sync);
 
 		/* skip offline cpus */
 		if (!cpu_online(cpu))
@@ -587,36 +385,36 @@ static int ot_start_sync(struct ot_ctrl *ctrl)
 	msleep(20);
 
 	/* in case no threads were created: memory insufficient ? */
-	if (atomic_dec_and_test(&g_ot_data.nthreads))
-		complete(&g_ot_data.wait);
+	if (atomic_dec_and_test(&test->data.nthreads))
+		complete(&test->data.wait);
 
 	// sched_set_fifo_low(current);
 
 	/* start objpool testing threads */
 	start = ktime_get();
-	up_write(&g_ot_data.start);
+	up_write(&test->data.start);
 
 	/* yeild cpu to worker threads for duration ms */
-	timeout = msecs_to_jiffies(ctrl->duration);
-	rc = schedule_timeout_interruptible(timeout);
+	timeout = msecs_to_jiffies(test->duration);
+	schedule_timeout_interruptible(timeout);
 
 	/* tell workers threads to quit */
-	atomic_set_release(&g_ot_data.stop, 1);
+	atomic_set_release(&test->data.stop, 1);
 
 	/* wait all workers threads finish and quit */
-	wait_for_completion(&g_ot_data.wait);
+	wait_for_completion(&test->data.wait);
 	duration = (u64) ktime_us_delta(ktime_get(), start);
 
 	/* cleanup objpool */
-	g_ot_sync_ops[ctrl->mode].fini(sop);
+	g_ot_sync_ops[test->mode].fini(sop);
 
 	/* report testing summary and performance results */
-	ot_perf_report(ctrl, duration);
+	ot_perf_report(test, duration);
 
 	/* report memory allocation summary */
-	ot_mem_report(ctrl);
+	ot_mem_report(test);
 
-	return rc;
+	return 0;
 }
 
 /*
@@ -626,29 +424,13 @@ static int ot_start_sync(struct ot_ctrl *ctrl)
 static void ot_fini_async_rcu(struct rcu_head *rcu)
 {
 	struct ot_context *sop = container_of(rcu, struct ot_context, rcu);
-	struct ot_node *on;
+	struct ot_test *test = sop->test;
 
-	/* here all cpus are aware of the stop event: g_ot_data.stop = 1 */
-	WARN_ON(!atomic_read_acquire(&g_ot_data.stop));
+	/* here all cpus are aware of the stop event: test->data.stop = 1 */
+	WARN_ON(!atomic_read_acquire(&test->data.stop));
 
-	do {
-		/* release all objects remained in objpool */
-		on = objpool_pop(&sop->pool);
-		if (on && !objpool_is_inslot(on, &sop->pool) &&
-			!objpool_is_inpool(on, &sop->pool)) {
-			/* private object managed by user */
-			WARN_ON(on->data != 0xDEADBEEF);
-			ot_kfree(on, sop->ctrl->objsz);
-		}
-
-		/* deref anyway since we've one extra ref grabbed */
-		if (refcount_dec_and_test(&sop->refs)) {
-			objpool_fini(&sop->pool);
-			break;
-		}
-	} while (on);
-
-	complete(&g_ot_data.rcu);
+	objpool_fini(&sop->pool);
+	complete(&test->data.rcu);
 }
 
 static void ot_fini_async(struct ot_context *sop)
@@ -657,175 +439,47 @@ static void ot_fini_async(struct ot_context *sop)
 	call_rcu(&sop->rcu, ot_fini_async_rcu);
 }
 
-static struct ot_context *ot_init_async_m0(struct ot_ctrl *ctrl)
+static int ot_objpool_release(struct objpool_head *head, void *context)
+{
+	struct ot_context *sop = context;
+
+	WARN_ON(!head || !sop || head != &sop->pool);
+
+	/* do context cleaning if needed */
+	if (sop)
+		ot_kfree(sop->test, sop, sizeof(*sop));
+
+	return 0;
+}
+
+static struct ot_context *ot_init_async_m0(struct ot_test *test)
 {
 	struct ot_context *sop = NULL;
 	int max = num_possible_cpus() << 3;
+	gfp_t gfp = GFP_KERNEL;
 
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
+	sop = (struct ot_context *)ot_kzalloc(test, sizeof(*sop));
 	if (!sop)
 		return NULL;
-	sop->ctrl = ctrl;
+	sop->test = test;
+	if (test->objsz < 512)
+		gfp = GFP_ATOMIC;
 
-	if (objpool_init(&sop->pool, max, max, ctrl->objsz, GFP_KERNEL,
-			sop, ot_init_node, ot_objpool_release)) {
-		ot_kfree(sop, sizeof(*sop));
+	if (objpool_init(&sop->pool, max, test->objsz, gfp, sop,
+			 ot_init_node, ot_objpool_release)) {
+		ot_kfree(test, sop, sizeof(*sop));
 		return NULL;
 	}
 	WARN_ON(max != sop->pool.nr_objs);
-	refcount_set(&sop->refs, max + 1);
 
 	return sop;
 }
 
-static struct ot_context *ot_init_async_m1(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	unsigned long size;
-	int szobj, rc, max = num_possible_cpus() << 3;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	szobj = ALIGN(ctrl->objsz, sizeof(void *));
-	size = szobj * max;
-	sop->ptr = ot_vmalloc(size);
-	sop->size = size;
-	if (!sop->ptr) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-	memset(sop->ptr, 0, size);
-
-	/* create and initialize objpool as empty (no objects) */
-	rc = objpool_init(&sop->pool, 0, max, 0, GFP_KERNEL, sop, NULL,
-			ot_objpool_release);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	/* populate given buffer to objpool */
-	rc = objpool_populate(&sop->pool, sop->ptr, size,
-			ctrl->objsz, sop, ot_init_node);
-	if (rc) {
-		objpool_fini(&sop->pool);
-		ot_vfree(sop->ptr, size);
-		return NULL;
-	}
-
-	/* calculate total number of objects stored in ptr */
-	WARN_ON(size / szobj != sop->pool.nr_objs);
-	refcount_set(&sop->refs, size / szobj + 1);
-
-	return sop;
-}
-
-static struct ot_context *ot_init_async_m2(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	struct ot_node *on;
-	int rc, i, nobjs = 0, max = num_possible_cpus() << 3;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	/* create and initialize objpool as empty (no objects) */
-	rc = objpool_init(&sop->pool, 0, max, 0, GFP_KERNEL, sop, NULL,
-			ot_objpool_release);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	/* allocate private objects and insert to objpool */
-	for (i = 0; i < max; i++) {
-		on = ot_kzalloc(ctrl->objsz);
-		if (on) {
-			ot_init_node(sop, on);
-			on->data = 0xDEADBEEF;
-			objpool_add(on, &sop->pool);
-			nobjs++;
-		}
-	}
-	WARN_ON(nobjs != sop->pool.nr_objs);
-	refcount_set(&sop->refs, nobjs + 1);
-
-	return sop;
-}
-
-/* objpool manipulation for synchronous mode 3 (mixed mode) */
-static struct ot_context *ot_init_async_m3(struct ot_ctrl *ctrl)
-{
-	struct ot_context *sop = NULL;
-	struct ot_node *on;
-	unsigned long size;
-	int szobj, nobjs, rc, i, max = num_possible_cpus() << 4;
-
-	sop = (struct ot_context *)ot_kzalloc(sizeof(*sop));
-	if (!sop)
-		return NULL;
-	sop->ctrl = ctrl;
-
-	/* create and initialize objpool as empty (no objects) */
-	nobjs = num_possible_cpus() * 2;
-	rc = objpool_init(&sop->pool, nobjs, max, ctrl->objsz, GFP_KERNEL,
-			sop, ot_init_node, ot_objpool_release);
-	if (rc) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-
-	szobj = ALIGN(ctrl->objsz, sizeof(void *));
-	size = szobj * num_possible_cpus() * 4;
-	sop->ptr = ot_vmalloc(size);
-	if (!sop->ptr) {
-		ot_kfree(sop, sizeof(*sop));
-		return NULL;
-	}
-	sop->size = size;
-	memset(sop->ptr, 0, size);
-
-	/* populate given buffer to objpool */
-	rc = objpool_populate(&sop->pool, sop->ptr, size,
-			ctrl->objsz, sop, ot_init_node);
-	if (rc) {
-		objpool_fini(&sop->pool);
-		ot_vfree(sop->ptr, size);
-		return NULL;
-	}
-
-	/* calculate total number of objects stored in ptr */
-	nobjs += size / szobj;
-
-	/* allocate private objects and insert to objpool */
-	for (i = 0; i < num_possible_cpus() * 2; i++) {
-		on = ot_kzalloc(ctrl->objsz);
-		if (on) {
-			ot_init_node(sop, on);
-			on->data = 0xDEADBEEF;
-			objpool_add(on, &sop->pool);
-			nobjs++;
-		}
-	}
-	WARN_ON(nobjs != sop->pool.nr_objs);
-	refcount_set(&sop->refs, nobjs + 1);
-
-	return sop;
-}
-
-struct {
-	struct ot_context * (*init)(struct ot_ctrl *);
+static struct {
+	struct ot_context * (*init)(struct ot_test *oc);
 	void (*fini)(struct ot_context *sop);
-} g_ot_async_ops[4] = {
+} g_ot_async_ops[] = {
 	{.init = ot_init_async_m0, .fini = ot_fini_async},
-	{.init = ot_init_async_m1, .fini = ot_fini_async},
-	{.init = ot_init_async_m2, .fini = ot_fini_async},
-	{.init = ot_init_async_m3, .fini = ot_fini_async},
 };
 
 static void ot_nod_recycle(struct ot_node *on, struct objpool_head *pool,
@@ -844,23 +498,13 @@ static void ot_nod_recycle(struct ot_node *on, struct objpool_head *pool,
 	sop = container_of(pool, struct ot_context, pool);
 	WARN_ON(sop != pool->context);
 
-	if (objpool_is_inslot(on, pool)) {
-		/* object is alloced from percpu slots */
-	} else if (objpool_is_inpool(on, pool)) {
-		/* object is alloced from user-manged pool */
-	} else {
-		/* private object managed by user */
-		WARN_ON(on->data != 0xDEADBEEF);
-		ot_kfree(on, sop->ctrl->objsz);
-	}
-
 	/* unref objpool with nod removed forever */
-	if (refcount_dec_and_test(&sop->refs))
-		objpool_fini(pool);
+	objpool_drop(on, pool);
 }
 
 static void ot_bulk_async(struct ot_item *item, int irq)
 {
+	struct ot_test *test = item->test;
 	struct ot_node *nods[OT_NR_MAX_BULK];
 	int i, stop;
 
@@ -873,7 +517,7 @@ static void ot_bulk_async(struct ot_item *item, int irq)
 		get_cpu();
 	}
 
-	stop = atomic_read_acquire(&g_ot_data.stop);
+	stop = atomic_read_acquire(&test->data.stop);
 
 	/* drop all objects and deref objpool */
 	while (i-- > 0) {
@@ -892,27 +536,27 @@ static void ot_bulk_async(struct ot_item *item, int irq)
 		put_cpu();
 }
 
-static int ot_start_async(struct ot_ctrl *ctrl)
+static int ot_start_async(struct ot_test *test)
 {
 	struct ot_context *sop;
 	ktime_t start;
 	u64 duration;
 	unsigned long timeout;
-	int cpu, rc;
+	int cpu;
 
 	/* initialize objpool for syncrhonous testcase */
-	sop = g_ot_async_ops[ctrl->mode].init(ctrl);
+	sop = g_ot_async_ops[test->mode].init(test);
 	if (!sop)
 		return -ENOMEM;
 
 	/* grab rwsem to block testing threads */
-	down_write(&g_ot_data.start);
+	down_write(&test->data.start);
 
 	for_each_possible_cpu(cpu) {
 		struct ot_item *item = per_cpu_ptr(&ot_pcup_items, cpu);
 		struct task_struct *work;
 
-		ot_init_cpu_item(item, ctrl, &sop->pool, ot_bulk_async);
+		ot_init_cpu_item(item, test, &sop->pool, ot_bulk_async);
 
 		/* skip offline cpus */
 		if (!cpu_online(cpu))
@@ -932,29 +576,29 @@ static int ot_start_async(struct ot_ctrl *ctrl)
 	msleep(20);
 
 	/* in case no threads were created: memory insufficient ? */
-	if (atomic_dec_and_test(&g_ot_data.nthreads))
-		complete(&g_ot_data.wait);
+	if (atomic_dec_and_test(&test->data.nthreads))
+		complete(&test->data.wait);
 
 	/* start objpool testing threads */
 	start = ktime_get();
-	up_write(&g_ot_data.start);
+	up_write(&test->data.start);
 
 	/* yeild cpu to worker threads for duration ms */
-	timeout = msecs_to_jiffies(ctrl->duration);
-	rc = schedule_timeout_interruptible(timeout);
+	timeout = msecs_to_jiffies(test->duration);
+	schedule_timeout_interruptible(timeout);
 
 	/* tell workers threads to quit */
-	atomic_set_release(&g_ot_data.stop, 1);
+	atomic_set_release(&test->data.stop, 1);
 
 	/* do async-finalization */
-	g_ot_async_ops[ctrl->mode].fini(sop);
+	g_ot_async_ops[test->mode].fini(sop);
 
 	/* wait all workers threads finish and quit */
-	wait_for_completion(&g_ot_data.wait);
+	wait_for_completion(&test->data.wait);
 	duration = (u64) ktime_us_delta(ktime_get(), start);
 
 	/* assure rcu callback is triggered */
-	wait_for_completion(&g_ot_data.rcu);
+	wait_for_completion(&test->data.rcu);
 
 	/*
 	 * now we are sure that objpool is finalized either
@@ -962,23 +606,25 @@ static int ot_start_async(struct ot_ctrl *ctrl)
 	 */
 
 	/* report testing summary and performance results */
-	ot_perf_report(ctrl, duration);
+	ot_perf_report(test, duration);
 
 	/* report memory allocation summary */
-	ot_mem_report(ctrl);
+	ot_mem_report(test);
 
-	return rc;
+	return 0;
 }
 
 /*
  * predefined testing cases:
- *   4 synchronous cases / 4 overrun cases / 2 async cases
+ *   synchronous case / overrun case / async case
  *
- * mode: unsigned int, could be 0/1/2/3, see name
- * duration: unsigned int, total test time in ms
- * delay: unsigned int, delay (in ms) between each iteration
- * bulk_normal: unsigned int, repeat times for thread worker
- * bulk_irq: unsigned int, repeat times for irq consumer
+ * async: synchronous or asynchronous testing
+ * mode: only mode 0 supported
+ * objsz: object size
+ * duration: int, total test time in ms
+ * delay: int, delay (in ms) between each iteration
+ * bulk_normal: int, repeat times for thread worker
+ * bulk_irq: int, repeat times for irq consumer
  * hrtimer: unsigned long, hrtimer intervnal in ms
  * name: char *, tag for current test ot_item
  */
@@ -986,58 +632,51 @@ static int ot_start_async(struct ot_ctrl *ctrl)
 #define NODE_COMPACT sizeof(struct ot_node)
 #define NODE_VMALLOC (512)
 
-struct ot_ctrl g_ot_sync[] = {
-	{0, NODE_COMPACT, 1000, 0,  1,  0,  0, "sync: percpu objpool"},
-	{0, NODE_VMALLOC, 1000, 0,  1,  0,  0, "sync: percpu objpool from vmalloc"},
-	{1, NODE_COMPACT, 1000, 0,  1,  0,  0, "sync: user objpool"},
-	{2, NODE_COMPACT, 1000, 0,  1,  0,  0, "sync: user objects"},
-	{3, NODE_COMPACT, 1000, 0,  1,  0,  0, "sync: mixed pools & objs"},
-	{3, NODE_VMALLOC, 1000, 0,  1,  0,  0, "sync: mixed pools & objs (vmalloc)"},
-};
+static struct ot_test g_testcases[] = {
 
-struct ot_ctrl g_ot_miss[] = {
-	{0, NODE_COMPACT, 1000, 0, 16,  0,  0, "sync overrun: percpu objpool"},
-	{0, NODE_VMALLOC, 1000, 0, 16,  0,  0, "sync overrun: percpu objpool from vmalloc"},
-	{1, NODE_COMPACT, 1000, 0, 16,  0,  0, "sync overrun: user objpool"},
-	{2, NODE_COMPACT, 1000, 0, 16,  0,  0, "sync overrun: user objects"},
-	{3, NODE_COMPACT, 1000, 0, 16,  0,  0, "sync overrun: mixed pools & objs"},
-	{3, NODE_VMALLOC, 1000, 0, 16,  0,  0, "sync overrun: mixed pools & objs (vmalloc)"},
-};
+	/* sync & normal */
+	{0, 0, NODE_COMPACT, 1000, 0,  1,  0,  0, "sync: percpu objpool"},
+	{0, 0, NODE_VMALLOC, 1000, 0,  1,  0,  0, "sync: percpu objpool from vmalloc"},
 
-struct ot_ctrl g_ot_async[] = {
-	{0, NODE_COMPACT, 1000, 4,  8,  8,  6, "async: percpu objpool"},
-	{0, NODE_VMALLOC, 1000, 4,  8,  8,  6, "async: percpu objpool from vmalloc"},
-	{1, NODE_COMPACT, 1000, 4,  8,  8,  6, "async: user objpool"},
-	{2, NODE_COMPACT, 1000, 4,  8,  8,  6, "async: user objects"},
-	{3, NODE_COMPACT, 1000, 4,  8,  8,  6, "async: mixed pools & objs"},
-	{3, NODE_VMALLOC, 1000, 4,  8,  8,  6, "async: mixed pools & objs (vmalloc)"},
+	/* sync & hrtimer */
+	{0, 0, NODE_COMPACT, 1000, 0,  1,  1,  4, "sync & hrtimer: percpu objpool"},
+	{0, 0, NODE_VMALLOC, 1000, 0,  1,  1,  4, "sync & hrtimer: percpu objpool from vmalloc"},
+
+	/* sync & overrun */
+	{0, 0, NODE_COMPACT, 1000, 0, 16,  0,  0, "sync overrun: percpu objpool"},
+	{0, 0, NODE_VMALLOC, 1000, 0, 16,  0,  0, "sync overrun: percpu objpool from vmalloc"},
+
+	/* async mode */
+	{1, 0, NODE_COMPACT, 1000, 100,  1,  0,  0, "async: percpu objpool"},
+	{1, 0, NODE_VMALLOC, 1000, 100,  1,  0,  0, "async: percpu objpool from vmalloc"},
+
+	/* async + hrtimer mode */
+	{1, 0, NODE_COMPACT, 1000, 0,  4,  4,  4, "async & hrtimer: percpu objpool"},
+	{1, 0, NODE_VMALLOC, 1000, 0,  4,  4,  4, "async & hrtimer: percpu objpool from vmalloc"},
 };
 
 static int __init ot_mod_init(void)
 {
 	int i;
 
-	ot_init_data(&g_ot_data);
-
-	for (i = 0; i < ARRAY_SIZE(g_ot_sync); i++) {
-		if (ot_start_sync(&g_ot_sync[i]))
-			goto out;
-		ot_reset_data(&g_ot_data);
+	/* perform testings */
+	for (i = 0; i < ARRAY_SIZE(g_testcases); i++) {
+		ot_init_data(&g_testcases[i].data);
+		if (g_testcases[i].async)
+			ot_start_async(&g_testcases[i]);
+		else
+			ot_start_sync(&g_testcases[i]);
 	}
 
-	for (i = 0; i < ARRAY_SIZE(g_ot_miss); i++) {
-		if (ot_start_sync(&g_ot_miss[i]))
-			goto out;
-		ot_reset_data(&g_ot_data);
+	/* show tests summary */
+	pr_info("\n");
+	pr_info("Summary of testcases:\n");
+	for (i = 0; i < ARRAY_SIZE(g_testcases); i++) {
+		pr_info("    duration: %lluus \thits: %10lu \tmiss: %10lu \t%s\n",
+			g_testcases[i].data.duration, g_testcases[i].data.objects.nhits,
+			g_testcases[i].data.objects.nmiss, g_testcases[i].name);
 	}
 
-	for (i = 0; i < ARRAY_SIZE(g_ot_async); i++) {
-		if (ot_start_async(&g_ot_async[i]))
-			goto out;
-		ot_reset_data(&g_ot_data);
-	}
-
-out:
 	return -EAGAIN;
 }
 
@@ -1049,4 +688,3 @@ module_init(ot_mod_init);
 module_exit(ot_mod_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Matt Wu");

@@ -4,484 +4,277 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/atomic.h>
-#include <linux/prefetch.h>
+#include <linux/irqflags.h>
+#include <linux/cpumask.h>
+#include <linux/log2.h>
 
 /*
  * objpool: ring-array based lockless MPMC/FIFO queues
  *
- * Copyright: wuqiang.matt@bytedance.com
+ * Copyright: wuqiang.matt@bytedance.com,mhiramat@kernel.org
  */
 
-/* compute the suitable num of objects to be managed by slot */
-static inline unsigned int __objpool_num_of_objs(unsigned int size)
+/* initialize percpu objpool_slot */
+static int
+objpool_init_percpu_slot(struct objpool_head *pool,
+			 struct objpool_slot *slot,
+			 int nodes, void *context,
+			 objpool_init_obj_cb objinit)
 {
-	return rounddown_pow_of_two((size - sizeof(struct objpool_slot)) /
-			(sizeof(uint32_t) + sizeof(void *)));
+	void *obj = (void *)&slot->entries[pool->capacity];
+	int i;
+
+	/* initialize elements of percpu objpool_slot */
+	slot->mask = pool->capacity - 1;
+
+	for (i = 0; i < nodes; i++) {
+		if (objinit) {
+			int rc = objinit(obj, context);
+			if (rc)
+				return rc;
+		}
+		slot->entries[slot->tail & slot->mask] = obj;
+		obj = obj + pool->obj_size;
+		slot->tail++;
+		slot->last = slot->tail;
+		pool->nr_objs++;
+	}
+
+	return 0;
 }
 
-#define SLOT_AGES(s) ((uint32_t *)((char *)(s) + sizeof(struct objpool_slot)))
-#define SLOT_ENTS(s) ((void **)((char *)(s) + sizeof(struct objpool_slot) + \
-			sizeof(uint32_t) * (s)->size))
-#define SLOT_OBJS(s) ((void *)((char *)(s) + sizeof(struct objpool_slot) + \
-			(sizeof(uint32_t) + sizeof(void *)) * (s)->size))
-
 /* allocate and initialize percpu slots */
-static inline int
-__objpool_init_percpu_slots(struct objpool_head *head, unsigned int nobjs,
-			void *context, objpool_init_obj_cb objinit)
+static int
+objpool_init_percpu_slots(struct objpool_head *pool, int nr_objs,
+			  void *context, objpool_init_obj_cb objinit)
 {
-	unsigned int i, j, n, size, objsz, nents = head->capacity;
+	int i, cpu_count = 0;
 
-	/* aligned object size by sizeof(void *) */
-	objsz = ALIGN(head->obj_size, sizeof(void *));
-	/* shall we allocate objects along with objpool_slot */
-	if (objsz)
-		head->flags |= OBJPOOL_HAVE_OBJECTS;
+	for (i = 0; i < pool->nr_cpus; i++) {
 
-	for (i = 0; i < head->nr_cpus; i++) {
-		struct objpool_slot *os;
+		struct objpool_slot *slot;
+		int nodes, size, rc;
 
-		/* compute how many objects to be managed by this slot */
-		n = nobjs / head->nr_cpus;
-		if (i < (nobjs % head->nr_cpus))
-			n++;
-		size = sizeof(struct objpool_slot) + sizeof(void *) * nents +
-		       sizeof(uint32_t) * nents + objsz * n;
-
-		/* decide memory area for cpu-slot allocation */
-		if (!i && !(head->gfp & GFP_ATOMIC) && size > PAGE_SIZE / 2)
-			head->flags |= OBJPOOL_FROM_VMALLOC;
-
-		/* allocate percpu slot & objects from local memory */
-		if (head->flags & OBJPOOL_FROM_VMALLOC)
-			os = __vmalloc_node(size, sizeof(void *), head->gfp,
-				cpu_to_node(i), __builtin_return_address(0));
-		else
-			os = kmalloc_node(size, head->gfp, cpu_to_node(i));
-		if (!os)
-			return -ENOMEM;
-
-		/* initialize percpu slot for the i-th cpu */
-		memset(os, 0, size);
-		os->size = head->capacity;
-		os->mask = os->size - 1;
-		head->cpu_slots[i] = os;
-		head->slot_sizes[i] = size;
-
-		/*
-		 * start from 2nd round to avoid conflict of 1st item.
-		 * we assume that the head item is ready for retrieval
-		 * iff head is equal to ages[head & mask]. but ages is
-		 * initialized as 0, so in view of the caller of pop(),
-		 * the 1st item (0th) is always ready, but fact could
-		 * be: push() is stalled before the final update, thus
-		 * the item being inserted will be lost forever.
-		 */
-		os->head = os->tail = head->capacity;
-
-		if (!objsz)
+		/* skip the cpu node which could never be present */
+		if (!cpu_possible(i))
 			continue;
 
-		for (j = 0; j < n; j++) {
-			uint32_t *ages = SLOT_AGES(os);
-			void **ents = SLOT_ENTS(os);
-			void *obj = SLOT_OBJS(os) + j * objsz;
-			uint32_t ie = os->tail & os->mask;
+		/* compute how many objects to be allocated with this slot */
+		nodes = nr_objs / num_possible_cpus();
+		if (cpu_count < (nr_objs % num_possible_cpus()))
+			nodes++;
+		cpu_count++;
 
-			/* perform object initialization */
-			if (objinit) {
-				int rc = objinit(context, obj);
-				if (rc)
-					return rc;
-			}
+		size = struct_size(slot, entries, pool->capacity) +
+			pool->obj_size * nodes;
 
-			/* add obj into the ring array */
-			ents[ie] = obj;
-			ages[ie] = os->tail;
-			os->tail++;
-			head->nr_objs++;
-		}
+		/*
+		 * here we allocate percpu-slot & objs together in a single
+		 * allocation to make it more compact, taking advantage of
+		 * warm caches and TLB hits. in default vmalloc is used to
+		 * reduce the pressure of kernel slab system. as we know,
+		 * mimimal size of vmalloc is one page since vmalloc would
+		 * always align the requested size to page size
+		 */
+		if (pool->gfp & GFP_ATOMIC)
+			slot = kmalloc_node(size, pool->gfp, cpu_to_node(i));
+		else
+			slot = __vmalloc_node(size, sizeof(void *), pool->gfp,
+				cpu_to_node(i), __builtin_return_address(0));
+		if (!slot)
+			return -ENOMEM;
+		memset(slot, 0, size);
+		pool->cpu_slots[i] = slot;
+
+		/* initialize the objpool_slot of cpu node i */
+		rc = objpool_init_percpu_slot(pool, slot, nodes, context, objinit);
+		if (rc)
+			return rc;
 	}
 
 	return 0;
 }
 
 /* cleanup all percpu slots of the object pool */
-static inline void __objpool_fini_percpu_slots(struct objpool_head *head)
+static void objpool_fini_percpu_slots(struct objpool_head *pool)
 {
-	unsigned int i;
+	int i;
 
-	if (!head->cpu_slots)
+	if (!pool->cpu_slots)
 		return;
 
-	for (i = 0; i < head->nr_cpus; i++) {
-		if (!head->cpu_slots[i])
-			continue;
-		if (head->flags & OBJPOOL_FROM_VMALLOC)
-			vfree(head->cpu_slots[i]);
-		else
-			kfree(head->cpu_slots[i]);
-	}
-	kfree(head->cpu_slots);
-	head->cpu_slots = NULL;
-	head->slot_sizes = NULL;
+	for (i = 0; i < pool->nr_cpus; i++)
+		kvfree(pool->cpu_slots[i]);
+	kfree(pool->cpu_slots);
 }
 
-/**
- * objpool_init: initialize object pool and pre-allocate objects
- *
- * args:
- * @head:    the object pool to be initialized, declared by caller
- * @nr_objs: total objects to be pre-allocated by this object pool
- * @max_objs: max entries (object pool capacity), use nr_objs if 0
- * @object_size: size of an object, no objects pre-allocated if 0
- * @gfp:     flags for memory allocation (via kmalloc or vmalloc)
- * @context: user context for object initialization callback
- * @objinit: object initialization callback for extra setting-up
- * @release: cleanup callback for private objects/pool/context
- *
- * return:
- *         0 for success, otherwise error code
- *
- * All pre-allocated objects are to be zeroed. Caller could do extra
- * initialization in objinit callback. The objinit callback will be
- * called once and only once after the slot allocation. Then objpool
- * won't touch any content of the objects since then. It's caller's
- * duty to perform reinitialization after object allocation (pop) or
- * clearance before object reclamation (push) if required.
- */
-int objpool_init(struct objpool_head *head, unsigned int nr_objs,
-		unsigned int max_objs, unsigned int object_size,
+/* initialize object pool and pre-allocate objects */
+int objpool_init(struct objpool_head *pool, int nr_objs, int object_size,
 		gfp_t gfp, void *context, objpool_init_obj_cb objinit,
-		objpool_release_cb release)
+		objpool_fini_cb release)
 {
-	unsigned int nents, ncpus = num_possible_cpus();
-	int rc;
+	int rc, capacity, slot_size;
 
-	/* calculate percpu slot size (rounded to pow of 2) */
-	if (max_objs < nr_objs)
-		max_objs = nr_objs;
-	nents = max_objs / ncpus;
-	if (nents < __objpool_num_of_objs(L1_CACHE_BYTES))
-		nents = __objpool_num_of_objs(L1_CACHE_BYTES);
-	nents = roundup_pow_of_two(nents);
-	while (nents * ncpus < nr_objs)
-		nents = nents << 1;
+	/* check input parameters */
+	if (nr_objs <= 0 || nr_objs > OBJPOOL_NR_OBJECT_MAX ||
+	    object_size <= 0 || object_size > OBJPOOL_OBJECT_SIZE_MAX)
+		return -EINVAL;
 
-	memset(head, 0, sizeof(struct objpool_head));
-	head->nr_cpus = ncpus;
-	head->obj_size = object_size;
-	head->capacity = nents;
-	head->gfp = gfp & ~__GFP_ZERO;
-	head->context = context;
-	head->release = release;
+	/* align up to unsigned long size */
+	object_size = ALIGN(object_size, sizeof(long));
 
-	/* allocate array for percpu slots */
-	head->cpu_slots = kzalloc(head->nr_cpus * sizeof(void *) +
-			       head->nr_cpus * sizeof(uint32_t), head->gfp);
-	if (!head->cpu_slots)
+	/* calculate capacity of percpu objpool_slot */
+	capacity = roundup_pow_of_two(nr_objs);
+	if (!capacity)
+		return -EINVAL;
+
+	/* initialize objpool pool */
+	memset(pool, 0, sizeof(struct objpool_head));
+	pool->nr_cpus = nr_cpu_ids;
+	pool->obj_size = object_size;
+	pool->capacity = capacity;
+	pool->gfp = gfp & ~__GFP_ZERO;
+	pool->context = context;
+	pool->release = release;
+	slot_size = pool->nr_cpus * sizeof(struct objpool_slot);
+	pool->cpu_slots = kzalloc(slot_size, pool->gfp);
+	if (!pool->cpu_slots)
 		return -ENOMEM;
-	head->slot_sizes = (uint32_t *)&head->cpu_slots[head->nr_cpus];
 
 	/* initialize per-cpu slots */
-	rc = __objpool_init_percpu_slots(head, nr_objs, context, objinit);
+	rc = objpool_init_percpu_slots(pool, nr_objs, context, objinit);
 	if (rc)
-		__objpool_fini_percpu_slots(head);
+		objpool_fini_percpu_slots(pool);
+	else
+		refcount_set(&pool->ref, pool->nr_objs + 1);
 
 	return rc;
 }
 EXPORT_SYMBOL_GPL(objpool_init);
 
-/* adding object to slot tail, the given slot must NOT be full */
-static inline int __objpool_add_slot(void *obj, struct objpool_slot *os)
-{
-	uint32_t *ages = SLOT_AGES(os);
-	void **ents = SLOT_ENTS(os);
-	uint32_t tail = atomic_inc_return((atomic_t *)&os->tail) - 1;
-
-	WRITE_ONCE(ents[tail & os->mask], obj);
-
-	/* order matters: obj must be updated before tail updating */
-	smp_store_release(&ages[tail & os->mask], tail);
-	return 0;
-}
-
 /* adding object to slot, abort if the slot was already full */
-static inline int __objpool_try_add_slot(void *obj, struct objpool_slot *os)
+static inline int
+objpool_try_add_slot(void *obj, struct objpool_head *pool, int cpu)
 {
-	uint32_t *ages = SLOT_AGES(os);
-	void **ents = SLOT_ENTS(os);
+	struct objpool_slot *slot = pool->cpu_slots[cpu];
 	uint32_t head, tail;
 
-	do {
-		/* perform memory loading for both head and tail */
-		head = READ_ONCE(os->head);
-		tail = READ_ONCE(os->tail);
-		/* just abort if slot is full */
-		if (tail >= head + os->size)
-			return -ENOENT;
-		/* try to extend tail by 1 using CAS to avoid races */
-		if (try_cmpxchg_acquire(&os->tail, &tail, tail + 1))
-			break;
-	} while (1);
+	/* loading tail and head as a local snapshot, tail first */
+	tail = READ_ONCE(slot->tail);
 
-	/* the tail-th of slot is reserved for the given obj */
-	WRITE_ONCE(ents[tail & os->mask], obj);
-	/* update epoch id to make this object available for pop() */
-	smp_store_release(&ages[tail & os->mask], tail);
+	do {
+		head = READ_ONCE(slot->head);
+		/* fault caught: something must be wrong */
+		WARN_ON_ONCE(tail - head > pool->nr_objs);
+	} while (!try_cmpxchg_acquire(&slot->tail, &tail, tail + 1));
+
+	/* now the tail position is reserved for the given obj */
+	WRITE_ONCE(slot->entries[tail & slot->mask], obj);
+	/* update sequence to make this obj available for pop() */
+	smp_store_release(&slot->last, tail + 1);
+
 	return 0;
 }
 
-/**
- * objpool_populate: add objects from user provided pool in batch
- *
- * args:
- * @head:  object pool
- * @pool: user buffer for pre-allocated objects
- * @size: size of user buffer
- * @object_size: size of object & element
- * @context: user context for objinit callback
- * @objinit: object initialization callback
- *
- * return: 0 or error code
- */
-int objpool_populate(struct objpool_head *head, void *pool,
-		unsigned int size, unsigned int object_size,
-		void *context, objpool_init_obj_cb objinit)
+/* reclaim an object to object pool */
+int objpool_push(void *obj, struct objpool_head *pool)
 {
-	unsigned int n = head->nr_objs, used = 0, i;
+	unsigned long flags;
+	int rc;
 
-	if (head->pool || !pool || size < object_size)
-		return -EINVAL;
-	if (head->obj_size && head->obj_size != object_size)
-		return -EINVAL;
-	if (head->context && context && head->context != context)
-		return -EINVAL;
-	if (head->nr_objs >= head->nr_cpus * head->capacity)
-		return -ENOENT;
+	/* disable local irq to avoid preemption & interruption */
+	raw_local_irq_save(flags);
+	rc = objpool_try_add_slot(obj, pool, raw_smp_processor_id());
+	raw_local_irq_restore(flags);
 
-	WARN_ON_ONCE(((unsigned long)pool) & (sizeof(void *) - 1));
-	WARN_ON_ONCE(((uint32_t)object_size) & (sizeof(void *) - 1));
-
-	/* align object size by sizeof(void *) */
-	head->obj_size = object_size;
-	object_size = ALIGN(object_size, sizeof(void *));
-	if (object_size == 0)
-		return -EINVAL;
-
-	while (used + object_size <= size) {
-		void *obj = pool + used;
-
-		/* perform object initialization */
-		if (objinit) {
-			int rc = objinit(context, obj);
-			if (rc)
-				return rc;
-		}
-
-		/* insert obj to its corresponding objpool slot */
-		i = (n + used * head->nr_cpus/size) % head->nr_cpus;
-		if (!__objpool_try_add_slot(obj, head->cpu_slots[i]))
-			head->nr_objs++;
-
-		used += object_size;
-	}
-
-	if (!used)
-		return -ENOENT;
-
-	head->context = context;
-	head->pool = pool;
-	head->pool_size = size;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(objpool_populate);
-
-/**
- * objpool_add: add pre-allocated object to objpool during pool
- * initialization
- *
- * args:
- * @obj:  object pointer to be added to objpool
- * @head: object pool to be inserted into
- *
- * return:
- *     0 or error code
- *
- * objpool_add_node doesn't handle race conditions, can only be
- * called during objpool initialization
- */
-int objpool_add(void *obj, struct objpool_head *head)
-{
-	unsigned int i, cpu;
-
-	if (!obj)
-		return -EINVAL;
-	if (head->nr_objs >= head->nr_cpus * head->capacity)
-		return -ENOENT;
-
-	cpu = head->nr_objs % head->nr_cpus;
-	for (i = 0; i < head->nr_cpus; i++) {
-		if (!__objpool_try_add_slot(obj, head->cpu_slots[cpu])) {
-			head->nr_objs++;
-			return 0;
-		}
-
-		if (++cpu >= head->nr_cpus)
-			cpu = 0;
-	}
-
-	return -ENOENT;
-}
-EXPORT_SYMBOL_GPL(objpool_add);
-
-/**
- * objpool_push: reclaim the object and return back to objects pool
- *
- * args:
- * @obj:  object pointer to be pushed to object pool
- * @head: object pool
- *
- * return:
- *     0 or error code: it fails only when objects pool are full
- *
- * objpool_push is non-blockable, and can be nested
- */
-int objpool_push(void *obj, struct objpool_head *head)
-{
-	unsigned int cpu = raw_smp_processor_id() % head->nr_cpus;
-
-	do {
-		if (head->nr_objs > head->capacity) {
-			if (!__objpool_try_add_slot(obj, head->cpu_slots[cpu]))
-				return 0;
-		} else {
-			if (!__objpool_add_slot(obj, head->cpu_slots[cpu]))
-				return 0;
-		}
-		if (++cpu >= head->nr_cpus)
-			cpu = 0;
-	} while (1);
-
-	return -ENOENT;
+	return rc;
 }
 EXPORT_SYMBOL_GPL(objpool_push);
 
 /* try to retrieve object from slot */
-static inline void *__objpool_try_get_slot(struct objpool_slot *os)
+static inline void *objpool_try_get_slot(struct objpool_head *pool, int cpu)
 {
-	uint32_t *ages = SLOT_AGES(os);
-	void **ents = SLOT_ENTS(os);
-	/* do memory load of head to local head */
-	uint32_t head = smp_load_acquire(&os->head);
+	struct objpool_slot *slot = pool->cpu_slots[cpu];
+	/* load head snapshot, other cpus may change it */
+	uint32_t head = smp_load_acquire(&slot->head);
 
-	/* loop if slot isn't empty */
-	while (head != READ_ONCE(os->tail)) {
-		uint32_t id = head & os->mask, prev = head;
+	while (head != READ_ONCE(slot->last)) {
+		void *obj;
 
-		/* do prefetching of object ents */
-		prefetch(&ents[id]);
+		/* obj must be retrieved before moving forward head */
+		obj = READ_ONCE(slot->entries[head & slot->mask]);
 
-		/*
-		 * check whether this item was ready for retrieval ? There's
-		 * possibility * in theory * we might retrieve wrong object,
-		 * in case ages[id] overflows when current task is sleeping,
-		 * but it will take very very long to overflow an uint32_t
-		 */
-		if (smp_load_acquire(&ages[id]) == head) {
-			/* node must have been udpated by push() */
-			void *node = READ_ONCE(ents[id]);
-			/* commit and move forward head of the slot */
-			if (try_cmpxchg_release(&os->head, &head, head + 1))
-				return node;
-		}
-
-		/* re-load head from memory continue trying */
-		head = READ_ONCE(os->head);
-		/*
-		 * head stays unchanged, so it's very likely current pop()
-		 * just preempted/interrupted an ongoing push() operation
-		 */
-		if (head == prev)
-			break;
+		/* move head forward to mark it's consumption */
+		if (try_cmpxchg_release(&slot->head, &head, head + 1))
+			return obj;
 	}
 
 	return NULL;
 }
 
-/**
- * objpool_pop: allocate an object from objects pool
- *
- * args:
- * @head:  object pool used to allocate an object
- *
- * return:
- *   object: NULL if failed (object pool is empty)
- *
- * objpool_pop can be nested, so can be used in any context.
- */
-void *objpool_pop(struct objpool_head *head)
+/* allocate an object from object pool */
+void *objpool_pop(struct objpool_head *pool)
 {
-	unsigned int i, cpu;
 	void *obj = NULL;
+	unsigned long flags;
+	int i, cpu;
 
-	cpu = raw_smp_processor_id() % head->nr_cpus;
-	for (i = 0; i < head->nr_cpus; i++) {
-		struct objpool_slot *slot = head->cpu_slots[cpu];
-		obj = __objpool_try_get_slot(slot);
+	/* disable local irq to avoid preemption & interruption */
+	raw_local_irq_save(flags);
+
+	cpu = raw_smp_processor_id();
+	for (i = 0; i < num_possible_cpus(); i++) {
+		obj = objpool_try_get_slot(pool, cpu);
 		if (obj)
 			break;
-		if (++cpu >= head->nr_cpus)
-			cpu = 0;
+		cpu = cpumask_next_wrap(cpu, cpu_possible_mask, -1, 1);
 	}
+	raw_local_irq_restore(flags);
 
 	return obj;
 }
 EXPORT_SYMBOL_GPL(objpool_pop);
 
-/**
- * objpool_fini: cleanup the whole object pool (releasing all objects)
- *
- * args:
- * @head: object pool to be released
- *
- */
-void objpool_fini(struct objpool_head *head)
+/* release whole objpool forcely */
+void objpool_free(struct objpool_head *pool)
 {
-	uint32_t i, flags;
-
-	if (!head->cpu_slots)
+	if (!pool->cpu_slots)
 		return;
-
-	if (!head->release) {
-		__objpool_fini_percpu_slots(head);
-		return;
-	}
-
-	/* cleanup all objects remained in objpool */
-	for (i = 0; i < head->nr_cpus; i++) {
-		void *obj;
-		do {
-			flags = OBJPOOL_FLAG_NODE;
-			obj = __objpool_try_get_slot(head->cpu_slots[i]);
-			if (!obj)
-				break;
-			if (!objpool_is_inpool(obj, head) &&
-			    !objpool_is_inslot(obj, head)) {
-				flags |= OBJPOOL_FLAG_USER;
-			}
-			head->release(head->context, obj, flags);
-		} while (obj);
-	}
 
 	/* release percpu slots */
-	__objpool_fini_percpu_slots(head);
+	objpool_fini_percpu_slots(pool);
 
-	/* cleanup user private pool and related context */
-	flags = OBJPOOL_FLAG_POOL;
-	if (head->pool)
-		flags |= OBJPOOL_FLAG_USER;
-	head->release(head->context, head->pool, flags);
+	/* call user's cleanup callback if provided */
+	if (pool->release)
+		pool->release(pool, pool->context);
+}
+EXPORT_SYMBOL_GPL(objpool_free);
+
+/* drop the allocated object, rather reclaim it to objpool */
+int objpool_drop(void *obj, struct objpool_head *pool)
+{
+	if (!obj || !pool)
+		return -EINVAL;
+
+	if (refcount_dec_and_test(&pool->ref)) {
+		objpool_free(pool);
+		return 0;
+	}
+
+	return -EAGAIN;
+}
+EXPORT_SYMBOL_GPL(objpool_drop);
+
+/* drop unused objects and defref objpool for releasing */
+void objpool_fini(struct objpool_head *pool)
+{
+	int count = 1; /* extra ref for objpool itself */
+
+	/* drop all remained objects from objpool */
+	while (objpool_pop(pool))
+		count++;
+
+	if (refcount_sub_and_test(count, &pool->ref))
+		objpool_free(pool);
 }
 EXPORT_SYMBOL_GPL(objpool_fini);
