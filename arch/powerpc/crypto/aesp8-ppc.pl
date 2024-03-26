@@ -132,11 +132,12 @@ rcon:
 .long	0x1b000000, 0x1b000000, 0x1b000000, 0x1b000000	?rev
 .long	0x0d0e0f0c, 0x0d0e0f0c, 0x0d0e0f0c, 0x0d0e0f0c	?rev
 .long	0,0,0,0						?asis
+.long	0x0f102132, 0x43546576, 0x8798a9ba, 0xcbdcedfe
 Lconsts:
 	mflr	r0
 	bcl	20,31,\$+4
 	mflr	$ptr	 #vvvvv "distance between . and rcon
-	addi	$ptr,$ptr,-0x48
+	addi	$ptr,$ptr,-0x58
 	mtlr	r0
 	blr
 	.long	0
@@ -529,6 +530,3309 @@ ___
 &gen_block("en");
 &gen_block("de");
 }}}
+#########################################################################
+{{{	# CBC en- and decrypt procedures				#
+my ($inp,$out,$len,$key,$ivp,$enc,$rounds,$idx)=map("r$_",(3..10));
+my ($rndkey0,$rndkey1,$inout,$tmp)=		map("v$_",(0..3));
+my ($ivec,$inptail,$inpperm,$outhead,$outperm,$outmask,$keyperm)=
+						map("v$_",(4..10));
+$code.=<<___;
+.globl	.${prefix}_cbc_encrypt
+	${UCMP}i	$len,16
+	bltlr-
+
+	cmpwi		$enc,0			# test direction
+	lis		r0,0xffe0
+	mfspr		$vrsave,256
+	mtspr		256,r0
+
+	li		$idx,15
+	vxor		$rndkey0,$rndkey0,$rndkey0
+	le?vspltisb	$tmp,0x0f
+
+	lvx		$ivec,0,$ivp		# load [unaligned] iv
+	lvsl		$inpperm,0,$ivp
+	lvx		$inptail,$idx,$ivp
+	le?vxor		$inpperm,$inpperm,$tmp
+	vperm		$ivec,$ivec,$inptail,$inpperm
+
+	neg		r11,$inp
+	?lvsl		$keyperm,0,$key		# prepare for unaligned key
+	lwz		$rounds,240($key)
+
+	lvsr		$inpperm,0,r11		# prepare for unaligned load
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,15		# 15 is not typo
+	le?vxor		$inpperm,$inpperm,$tmp
+
+	?lvsr		$outperm,0,$out		# prepare for unaligned store
+	vspltisb	$outmask,-1
+	lvx		$outhead,0,$out
+	?vperm		$outmask,$rndkey0,$outmask,$outperm
+	le?vxor		$outperm,$outperm,$tmp
+
+	srwi		$rounds,$rounds,1
+	li		$idx,16
+	subi		$rounds,$rounds,1
+	beq		Lcbc_dec
+
+Lcbc_enc:
+	vmr		$inout,$inptail
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+	mtctr		$rounds
+	subi		$len,$len,16		# len-=16
+
+	lvx		$rndkey0,0,$key
+	 vperm		$inout,$inout,$inptail,$inpperm
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+	vxor		$inout,$inout,$ivec
+
+Loop_cbc_enc:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipher		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+	bdnz		Loop_cbc_enc
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	li		$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipherlast	$ivec,$inout,$rndkey0
+	${UCMP}i	$len,16
+
+	vperm		$tmp,$ivec,$ivec,$outperm
+	vsel		$inout,$outhead,$tmp,$outmask
+	vmr		$outhead,$tmp
+	stvx		$inout,0,$out
+	addi		$out,$out,16
+	bge		Lcbc_enc
+
+	b		Lcbc_done
+
+.align	4
+Lcbc_dec:
+	${UCMP}i	$len,128
+	bge		_aesp8_cbc_decrypt8x
+	vmr		$tmp,$inptail
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+	mtctr		$rounds
+	subi		$len,$len,16		# len-=16
+
+	lvx		$rndkey0,0,$key
+	 vperm		$tmp,$tmp,$inptail,$inpperm
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$tmp,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+
+Loop_cbc_dec:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vncipher	$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+	bdnz		Loop_cbc_dec
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	li		$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vncipherlast	$inout,$inout,$rndkey0
+	${UCMP}i	$len,16
+
+	vxor		$inout,$inout,$ivec
+	vmr		$ivec,$tmp
+	vperm		$tmp,$inout,$inout,$outperm
+	vsel		$inout,$outhead,$tmp,$outmask
+	vmr		$outhead,$tmp
+	stvx		$inout,0,$out
+	addi		$out,$out,16
+	bge		Lcbc_dec
+
+Lcbc_done:
+	addi		$out,$out,-1
+	lvx		$inout,0,$out		# redundant in aligned case
+	vsel		$inout,$outhead,$inout,$outmask
+	stvx		$inout,0,$out
+
+	neg		$enc,$ivp		# write [unaligned] iv
+	li		$idx,15			# 15 is not typo
+	vxor		$rndkey0,$rndkey0,$rndkey0
+	vspltisb	$outmask,-1
+	le?vspltisb	$tmp,0x0f
+	?lvsl		$outperm,0,$enc
+	?vperm		$outmask,$rndkey0,$outmask,$outperm
+	le?vxor		$outperm,$outperm,$tmp
+	lvx		$outhead,0,$ivp
+	vperm		$ivec,$ivec,$ivec,$outperm
+	vsel		$inout,$outhead,$ivec,$outmask
+	lvx		$inptail,$idx,$ivp
+	stvx		$inout,0,$ivp
+	vsel		$inout,$ivec,$inptail,$outmask
+	stvx		$inout,$idx,$ivp
+
+	mtspr		256,$vrsave
+	blr
+	.long		0
+	.byte		0,12,0x14,0,0,0,6,0
+	.long		0
+___
+#########################################################################
+{{	# Optimized CBC decrypt procedure				#
+my $key_="r11";
+my ($x00,$x10,$x20,$x30,$x40,$x50,$x60,$x70)=map("r$_",(0,8,26..31));
+my ($in0, $in1, $in2, $in3, $in4, $in5, $in6, $in7 )=map("v$_",(0..3,10..13));
+my ($out0,$out1,$out2,$out3,$out4,$out5,$out6,$out7)=map("v$_",(14..21));
+my $rndkey0="v23";	# v24-v25 rotating buffer for first found keys
+			# v26-v31 last 6 round keys
+my ($tmp,$keyperm)=($in3,$in4);	# aliases with "caller", redundant assignment
+
+$code.=<<___;
+.align	5
+_aesp8_cbc_decrypt8x:
+	$STU		$sp,-`($FRAME+21*16+6*$SIZE_T)`($sp)
+	li		r10,`$FRAME+8*16+15`
+	li		r11,`$FRAME+8*16+31`
+	stvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	stvx		v21,r11,$sp
+	addi		r11,r11,32
+	stvx		v22,r10,$sp
+	addi		r10,r10,32
+	stvx		v23,r11,$sp
+	addi		r11,r11,32
+	stvx		v24,r10,$sp
+	addi		r10,r10,32
+	stvx		v25,r11,$sp
+	addi		r11,r11,32
+	stvx		v26,r10,$sp
+	addi		r10,r10,32
+	stvx		v27,r11,$sp
+	addi		r11,r11,32
+	stvx		v28,r10,$sp
+	addi		r10,r10,32
+	stvx		v29,r11,$sp
+	addi		r11,r11,32
+	stvx		v30,r10,$sp
+	stvx		v31,r11,$sp
+	li		r0,-1
+	stw		$vrsave,`$FRAME+21*16-4`($sp)	# save vrsave
+	li		$x10,0x10
+	$PUSH		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	li		$x20,0x20
+	$PUSH		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	li		$x30,0x30
+	$PUSH		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	li		$x40,0x40
+	$PUSH		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	li		$x50,0x50
+	$PUSH		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	li		$x60,0x60
+	$PUSH		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	li		$x70,0x70
+	mtspr		256,r0
+
+	subi		$rounds,$rounds,3	# -4 in total
+	subi		$len,$len,128		# bias
+
+	lvx		$rndkey0,$x00,$key	# load key schedule
+	lvx		v30,$x10,$key
+	addi		$key,$key,0x20
+	lvx		v31,$x00,$key
+	?vperm		$rndkey0,$rndkey0,v30,$keyperm
+	addi		$key_,$sp,$FRAME+15
+	mtctr		$rounds
+
+Load_cbc_dec_key:
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v30,$x10,$key
+	addi		$key,$key,0x20
+	stvx		v24,$x00,$key_		# off-load round[1]
+	?vperm		v25,v31,v30,$keyperm
+	lvx		v31,$x00,$key
+	stvx		v25,$x10,$key_		# off-load round[2]
+	addi		$key_,$key_,0x20
+	bdnz		Load_cbc_dec_key
+
+	lvx		v26,$x10,$key
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v27,$x20,$key
+	stvx		v24,$x00,$key_		# off-load round[3]
+	?vperm		v25,v31,v26,$keyperm
+	lvx		v28,$x30,$key
+	stvx		v25,$x10,$key_		# off-load round[4]
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	?vperm		v26,v26,v27,$keyperm
+	lvx		v29,$x40,$key
+	?vperm		v27,v27,v28,$keyperm
+	lvx		v30,$x50,$key
+	?vperm		v28,v28,v29,$keyperm
+	lvx		v31,$x60,$key
+	?vperm		v29,v29,v30,$keyperm
+	lvx		$out0,$x70,$key		# borrow $out0
+	?vperm		v30,v30,v31,$keyperm
+	lvx		v24,$x00,$key_		# pre-load round[1]
+	?vperm		v31,v31,$out0,$keyperm
+	lvx		v25,$x10,$key_		# pre-load round[2]
+
+	#lvx		$inptail,0,$inp		# "caller" already did this
+	#addi		$inp,$inp,15		# 15 is not typo
+	subi		$inp,$inp,15		# undo "caller"
+
+	 le?li		$idx,8
+	lvx_u		$in0,$x00,$inp		# load first 8 "words"
+	 le?lvsl	$inpperm,0,$idx
+	 le?vspltisb	$tmp,0x0f
+	lvx_u		$in1,$x10,$inp
+	 le?vxor	$inpperm,$inpperm,$tmp	# transform for lvx_u/stvx_u
+	lvx_u		$in2,$x20,$inp
+	 le?vperm	$in0,$in0,$in0,$inpperm
+	lvx_u		$in3,$x30,$inp
+	 le?vperm	$in1,$in1,$in1,$inpperm
+	lvx_u		$in4,$x40,$inp
+	 le?vperm	$in2,$in2,$in2,$inpperm
+	vxor		$out0,$in0,$rndkey0
+	lvx_u		$in5,$x50,$inp
+	 le?vperm	$in3,$in3,$in3,$inpperm
+	vxor		$out1,$in1,$rndkey0
+	lvx_u		$in6,$x60,$inp
+	 le?vperm	$in4,$in4,$in4,$inpperm
+	vxor		$out2,$in2,$rndkey0
+	lvx_u		$in7,$x70,$inp
+	addi		$inp,$inp,0x80
+	 le?vperm	$in5,$in5,$in5,$inpperm
+	vxor		$out3,$in3,$rndkey0
+	 le?vperm	$in6,$in6,$in6,$inpperm
+	vxor		$out4,$in4,$rndkey0
+	 le?vperm	$in7,$in7,$in7,$inpperm
+	vxor		$out5,$in5,$rndkey0
+	vxor		$out6,$in6,$rndkey0
+	vxor		$out7,$in7,$rndkey0
+
+	mtctr		$rounds
+	b		Loop_cbc_dec8x
+.align	5
+Loop_cbc_dec8x:
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+	vncipher	$out6,$out6,v24
+	vncipher	$out7,$out7,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+	vncipher	$out6,$out6,v25
+	vncipher	$out7,$out7,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_cbc_dec8x
+
+	subic		$len,$len,128		# $len-=128
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+	vncipher	$out6,$out6,v24
+	vncipher	$out7,$out7,v24
+
+	subfe.		r0,r0,r0		# borrow?-1:0
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+	vncipher	$out6,$out6,v25
+	vncipher	$out7,$out7,v25
+
+	and		r0,r0,$len
+	vncipher	$out0,$out0,v26
+	vncipher	$out1,$out1,v26
+	vncipher	$out2,$out2,v26
+	vncipher	$out3,$out3,v26
+	vncipher	$out4,$out4,v26
+	vncipher	$out5,$out5,v26
+	vncipher	$out6,$out6,v26
+	vncipher	$out7,$out7,v26
+
+	add		$inp,$inp,r0		# $inp is adjusted in such
+						# way that at exit from the
+						# loop inX-in7 are loaded
+						# with last "words"
+	vncipher	$out0,$out0,v27
+	vncipher	$out1,$out1,v27
+	vncipher	$out2,$out2,v27
+	vncipher	$out3,$out3,v27
+	vncipher	$out4,$out4,v27
+	vncipher	$out5,$out5,v27
+	vncipher	$out6,$out6,v27
+	vncipher	$out7,$out7,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vncipher	$out0,$out0,v28
+	vncipher	$out1,$out1,v28
+	vncipher	$out2,$out2,v28
+	vncipher	$out3,$out3,v28
+	vncipher	$out4,$out4,v28
+	vncipher	$out5,$out5,v28
+	vncipher	$out6,$out6,v28
+	vncipher	$out7,$out7,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+
+	vncipher	$out0,$out0,v29
+	vncipher	$out1,$out1,v29
+	vncipher	$out2,$out2,v29
+	vncipher	$out3,$out3,v29
+	vncipher	$out4,$out4,v29
+	vncipher	$out5,$out5,v29
+	vncipher	$out6,$out6,v29
+	vncipher	$out7,$out7,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+
+	vncipher	$out0,$out0,v30
+	 vxor		$ivec,$ivec,v31		# xor with last round key
+	vncipher	$out1,$out1,v30
+	 vxor		$in0,$in0,v31
+	vncipher	$out2,$out2,v30
+	 vxor		$in1,$in1,v31
+	vncipher	$out3,$out3,v30
+	 vxor		$in2,$in2,v31
+	vncipher	$out4,$out4,v30
+	 vxor		$in3,$in3,v31
+	vncipher	$out5,$out5,v30
+	 vxor		$in4,$in4,v31
+	vncipher	$out6,$out6,v30
+	 vxor		$in5,$in5,v31
+	vncipher	$out7,$out7,v30
+	 vxor		$in6,$in6,v31
+
+	vncipherlast	$out0,$out0,$ivec
+	vncipherlast	$out1,$out1,$in0
+	 lvx_u		$in0,$x00,$inp		# load next input block
+	vncipherlast	$out2,$out2,$in1
+	 lvx_u		$in1,$x10,$inp
+	vncipherlast	$out3,$out3,$in2
+	 le?vperm	$in0,$in0,$in0,$inpperm
+	 lvx_u		$in2,$x20,$inp
+	vncipherlast	$out4,$out4,$in3
+	 le?vperm	$in1,$in1,$in1,$inpperm
+	 lvx_u		$in3,$x30,$inp
+	vncipherlast	$out5,$out5,$in4
+	 le?vperm	$in2,$in2,$in2,$inpperm
+	 lvx_u		$in4,$x40,$inp
+	vncipherlast	$out6,$out6,$in5
+	 le?vperm	$in3,$in3,$in3,$inpperm
+	 lvx_u		$in5,$x50,$inp
+	vncipherlast	$out7,$out7,$in6
+	 le?vperm	$in4,$in4,$in4,$inpperm
+	 lvx_u		$in6,$x60,$inp
+	vmr		$ivec,$in7
+	 le?vperm	$in5,$in5,$in5,$inpperm
+	 lvx_u		$in7,$x70,$inp
+	 addi		$inp,$inp,0x80
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	 le?vperm	$in6,$in6,$in6,$inpperm
+	 vxor		$out0,$in0,$rndkey0
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	 le?vperm	$in7,$in7,$in7,$inpperm
+	 vxor		$out1,$in1,$rndkey0
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	 vxor		$out2,$in2,$rndkey0
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x30,$out
+	 vxor		$out3,$in3,$rndkey0
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x40,$out
+	 vxor		$out4,$in4,$rndkey0
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x50,$out
+	 vxor		$out5,$in5,$rndkey0
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x60,$out
+	 vxor		$out6,$in6,$rndkey0
+	stvx_u		$out7,$x70,$out
+	addi		$out,$out,0x80
+	 vxor		$out7,$in7,$rndkey0
+
+	mtctr		$rounds
+	beq		Loop_cbc_dec8x		# did $len-=128 borrow?
+
+	addic.		$len,$len,128
+	beq		Lcbc_dec8x_done
+	nop
+	nop
+
+Loop_cbc_dec8x_tail:				# up to 7 "words" tail...
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+	vncipher	$out6,$out6,v24
+	vncipher	$out7,$out7,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+	vncipher	$out6,$out6,v25
+	vncipher	$out7,$out7,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_cbc_dec8x_tail
+
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+	vncipher	$out6,$out6,v24
+	vncipher	$out7,$out7,v24
+
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+	vncipher	$out6,$out6,v25
+	vncipher	$out7,$out7,v25
+
+	vncipher	$out1,$out1,v26
+	vncipher	$out2,$out2,v26
+	vncipher	$out3,$out3,v26
+	vncipher	$out4,$out4,v26
+	vncipher	$out5,$out5,v26
+	vncipher	$out6,$out6,v26
+	vncipher	$out7,$out7,v26
+
+	vncipher	$out1,$out1,v27
+	vncipher	$out2,$out2,v27
+	vncipher	$out3,$out3,v27
+	vncipher	$out4,$out4,v27
+	vncipher	$out5,$out5,v27
+	vncipher	$out6,$out6,v27
+	vncipher	$out7,$out7,v27
+
+	vncipher	$out1,$out1,v28
+	vncipher	$out2,$out2,v28
+	vncipher	$out3,$out3,v28
+	vncipher	$out4,$out4,v28
+	vncipher	$out5,$out5,v28
+	vncipher	$out6,$out6,v28
+	vncipher	$out7,$out7,v28
+
+	vncipher	$out1,$out1,v29
+	vncipher	$out2,$out2,v29
+	vncipher	$out3,$out3,v29
+	vncipher	$out4,$out4,v29
+	vncipher	$out5,$out5,v29
+	vncipher	$out6,$out6,v29
+	vncipher	$out7,$out7,v29
+
+	vncipher	$out1,$out1,v30
+	 vxor		$ivec,$ivec,v31		# last round key
+	vncipher	$out2,$out2,v30
+	 vxor		$in1,$in1,v31
+	vncipher	$out3,$out3,v30
+	 vxor		$in2,$in2,v31
+	vncipher	$out4,$out4,v30
+	 vxor		$in3,$in3,v31
+	vncipher	$out5,$out5,v30
+	 vxor		$in4,$in4,v31
+	vncipher	$out6,$out6,v30
+	 vxor		$in5,$in5,v31
+	vncipher	$out7,$out7,v30
+	 vxor		$in6,$in6,v31
+
+	cmplwi		$len,32			# switch($len)
+	blt		Lcbc_dec8x_one
+	nop
+	beq		Lcbc_dec8x_two
+	cmplwi		$len,64
+	blt		Lcbc_dec8x_three
+	nop
+	beq		Lcbc_dec8x_four
+	cmplwi		$len,96
+	blt		Lcbc_dec8x_five
+	nop
+	beq		Lcbc_dec8x_six
+
+Lcbc_dec8x_seven:
+	vncipherlast	$out1,$out1,$ivec
+	vncipherlast	$out2,$out2,$in1
+	vncipherlast	$out3,$out3,$in2
+	vncipherlast	$out4,$out4,$in3
+	vncipherlast	$out5,$out5,$in4
+	vncipherlast	$out6,$out6,$in5
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out1,$out1,$out1,$inpperm
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x00,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x10,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x20,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x30,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x40,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x50,$out
+	stvx_u		$out7,$x60,$out
+	addi		$out,$out,0x70
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_six:
+	vncipherlast	$out2,$out2,$ivec
+	vncipherlast	$out3,$out3,$in2
+	vncipherlast	$out4,$out4,$in3
+	vncipherlast	$out5,$out5,$in4
+	vncipherlast	$out6,$out6,$in5
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out2,$out2,$out2,$inpperm
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x00,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x10,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x20,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x30,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x40,$out
+	stvx_u		$out7,$x50,$out
+	addi		$out,$out,0x60
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_five:
+	vncipherlast	$out3,$out3,$ivec
+	vncipherlast	$out4,$out4,$in3
+	vncipherlast	$out5,$out5,$in4
+	vncipherlast	$out6,$out6,$in5
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out3,$out3,$out3,$inpperm
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x00,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x10,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x20,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x30,$out
+	stvx_u		$out7,$x40,$out
+	addi		$out,$out,0x50
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_four:
+	vncipherlast	$out4,$out4,$ivec
+	vncipherlast	$out5,$out5,$in4
+	vncipherlast	$out6,$out6,$in5
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out4,$out4,$out4,$inpperm
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x00,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x10,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x20,$out
+	stvx_u		$out7,$x30,$out
+	addi		$out,$out,0x40
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_three:
+	vncipherlast	$out5,$out5,$ivec
+	vncipherlast	$out6,$out6,$in5
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out5,$out5,$out5,$inpperm
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x00,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x10,$out
+	stvx_u		$out7,$x20,$out
+	addi		$out,$out,0x30
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_two:
+	vncipherlast	$out6,$out6,$ivec
+	vncipherlast	$out7,$out7,$in6
+	vmr		$ivec,$in7
+
+	le?vperm	$out6,$out6,$out6,$inpperm
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x00,$out
+	stvx_u		$out7,$x10,$out
+	addi		$out,$out,0x20
+	b		Lcbc_dec8x_done
+
+.align	5
+Lcbc_dec8x_one:
+	vncipherlast	$out7,$out7,$ivec
+	vmr		$ivec,$in7
+
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out7,0,$out
+	addi		$out,$out,0x10
+
+Lcbc_dec8x_done:
+	le?vperm	$ivec,$ivec,$ivec,$inpperm
+	stvx_u		$ivec,0,$ivp		# write [unaligned] iv
+
+	li		r10,`$FRAME+15`
+	li		r11,`$FRAME+31`
+	stvx		$inpperm,r10,$sp	# wipe copies of round keys
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+
+	mtspr		256,$vrsave
+	lvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	lvx		v21,r11,$sp
+	addi		r11,r11,32
+	lvx		v22,r10,$sp
+	addi		r10,r10,32
+	lvx		v23,r11,$sp
+	addi		r11,r11,32
+	lvx		v24,r10,$sp
+	addi		r10,r10,32
+	lvx		v25,r11,$sp
+	addi		r11,r11,32
+	lvx		v26,r10,$sp
+	addi		r10,r10,32
+	lvx		v27,r11,$sp
+	addi		r11,r11,32
+	lvx		v28,r10,$sp
+	addi		r10,r10,32
+	lvx		v29,r11,$sp
+	addi		r11,r11,32
+	lvx		v30,r10,$sp
+	lvx		v31,r11,$sp
+	$POP		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	$POP		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	$POP		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	$POP		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	$POP		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	$POP		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	addi		$sp,$sp,`$FRAME+21*16+6*$SIZE_T`
+	blr
+	.long		0
+	.byte		0,12,0x14,0,0x80,6,6,0
+	.long		0
+.size	.${prefix}_cbc_encrypt,.-.${prefix}_cbc_encrypt
+___
+}}	}}}
+
+#########################################################################
+{{{	# CTR procedure[s]						#
+
+####################### WARNING: Here be dragons! #######################
+#
+# This code is written as 'ctr32', based on a 32-bit counter used
+# upstream. The kernel does *not* use a 32-bit counter. The kernel uses
+# a 128-bit counter.
+#
+# This leads to subtle changes from the upstream code: the counter
+# is incremented with vaddu_q_m rather than vaddu_w_m. This occurs in
+# both the bulk (8 blocks at a time) path, and in the individual block
+# path. Be aware of this when doing updates.
+#
+# See:
+# 1d4aa0b4c181 ("crypto: vmx - Fixing AES-CTR counter bug")
+# 009b30ac7444 ("crypto: vmx - CTR: always increment IV as quadword")
+# https://github.com/openssl/openssl/pull/8942
+#
+#########################################################################
+my ($inp,$out,$len,$key,$ivp,$x10,$rounds,$idx)=map("r$_",(3..10));
+my ($rndkey0,$rndkey1,$inout,$tmp)=		map("v$_",(0..3));
+my ($ivec,$inptail,$inpperm,$outhead,$outperm,$outmask,$keyperm,$one)=
+						map("v$_",(4..11));
+my $dat=$tmp;
+
+$code.=<<___;
+.globl	.${prefix}_ctr32_encrypt_blocks
+	${UCMP}i	$len,1
+	bltlr-
+
+	lis		r0,0xfff0
+	mfspr		$vrsave,256
+	mtspr		256,r0
+
+	li		$idx,15
+	vxor		$rndkey0,$rndkey0,$rndkey0
+	le?vspltisb	$tmp,0x0f
+
+	lvx		$ivec,0,$ivp		# load [unaligned] iv
+	lvsl		$inpperm,0,$ivp
+	lvx		$inptail,$idx,$ivp
+	 vspltisb	$one,1
+	le?vxor		$inpperm,$inpperm,$tmp
+	vperm		$ivec,$ivec,$inptail,$inpperm
+	 vsldoi		$one,$rndkey0,$one,1
+
+	neg		r11,$inp
+	?lvsl		$keyperm,0,$key		# prepare for unaligned key
+	lwz		$rounds,240($key)
+
+	lvsr		$inpperm,0,r11		# prepare for unaligned load
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,15		# 15 is not typo
+	le?vxor		$inpperm,$inpperm,$tmp
+
+	srwi		$rounds,$rounds,1
+	li		$idx,16
+	subi		$rounds,$rounds,1
+
+	${UCMP}i	$len,8
+	bge		_aesp8_ctr32_encrypt8x
+
+	?lvsr		$outperm,0,$out		# prepare for unaligned store
+	vspltisb	$outmask,-1
+	lvx		$outhead,0,$out
+	?vperm		$outmask,$rndkey0,$outmask,$outperm
+	le?vxor		$outperm,$outperm,$tmp
+
+	lvx		$rndkey0,0,$key
+	mtctr		$rounds
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$ivec,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+	b		Loop_ctr32_enc
+
+.align	5
+Loop_ctr32_enc:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipher		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key
+	addi		$idx,$idx,16
+	bdnz		Loop_ctr32_enc
+
+	vadduqm		$ivec,$ivec,$one	# Kernel change for 128-bit
+	 vmr		$dat,$inptail
+	 lvx		$inptail,0,$inp
+	 addi		$inp,$inp,16
+	 subic.		$len,$len,1		# blocks--
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key
+	 vperm		$dat,$dat,$inptail,$inpperm
+	 li		$idx,16
+	?vperm		$rndkey1,$rndkey0,$rndkey1,$keyperm
+	 lvx		$rndkey0,0,$key
+	vxor		$dat,$dat,$rndkey1	# last round key
+	vcipherlast	$inout,$inout,$dat
+
+	 lvx		$rndkey1,$idx,$key
+	 addi		$idx,$idx,16
+	vperm		$inout,$inout,$inout,$outperm
+	vsel		$dat,$outhead,$inout,$outmask
+	 mtctr		$rounds
+	 ?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vmr		$outhead,$inout
+	 vxor		$inout,$ivec,$rndkey0
+	 lvx		$rndkey0,$idx,$key
+	 addi		$idx,$idx,16
+	stvx		$dat,0,$out
+	addi		$out,$out,16
+	bne		Loop_ctr32_enc
+
+	addi		$out,$out,-1
+	lvx		$inout,0,$out		# redundant in aligned case
+	vsel		$inout,$outhead,$inout,$outmask
+	stvx		$inout,0,$out
+
+	mtspr		256,$vrsave
+	blr
+	.long		0
+	.byte		0,12,0x14,0,0,0,6,0
+	.long		0
+___
+#########################################################################
+{{	# Optimized CTR procedure					#
+my $key_="r11";
+my ($x00,$x10,$x20,$x30,$x40,$x50,$x60,$x70)=map("r$_",(0,8,26..31));
+my ($in0, $in1, $in2, $in3, $in4, $in5, $in6, $in7 )=map("v$_",(0..3,10,12..14));
+my ($out0,$out1,$out2,$out3,$out4,$out5,$out6,$out7)=map("v$_",(15..22));
+my $rndkey0="v23";	# v24-v25 rotating buffer for first found keys
+			# v26-v31 last 6 round keys
+my ($tmp,$keyperm)=($in3,$in4);	# aliases with "caller", redundant assignment
+my ($two,$three,$four)=($outhead,$outperm,$outmask);
+
+$code.=<<___;
+.align	5
+_aesp8_ctr32_encrypt8x:
+	$STU		$sp,-`($FRAME+21*16+6*$SIZE_T)`($sp)
+	li		r10,`$FRAME+8*16+15`
+	li		r11,`$FRAME+8*16+31`
+	stvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	stvx		v21,r11,$sp
+	addi		r11,r11,32
+	stvx		v22,r10,$sp
+	addi		r10,r10,32
+	stvx		v23,r11,$sp
+	addi		r11,r11,32
+	stvx		v24,r10,$sp
+	addi		r10,r10,32
+	stvx		v25,r11,$sp
+	addi		r11,r11,32
+	stvx		v26,r10,$sp
+	addi		r10,r10,32
+	stvx		v27,r11,$sp
+	addi		r11,r11,32
+	stvx		v28,r10,$sp
+	addi		r10,r10,32
+	stvx		v29,r11,$sp
+	addi		r11,r11,32
+	stvx		v30,r10,$sp
+	stvx		v31,r11,$sp
+	li		r0,-1
+	stw		$vrsave,`$FRAME+21*16-4`($sp)	# save vrsave
+	li		$x10,0x10
+	$PUSH		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	li		$x20,0x20
+	$PUSH		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	li		$x30,0x30
+	$PUSH		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	li		$x40,0x40
+	$PUSH		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	li		$x50,0x50
+	$PUSH		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	li		$x60,0x60
+	$PUSH		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	li		$x70,0x70
+	mtspr		256,r0
+
+	subi		$rounds,$rounds,3	# -4 in total
+
+	lvx		$rndkey0,$x00,$key	# load key schedule
+	lvx		v30,$x10,$key
+	addi		$key,$key,0x20
+	lvx		v31,$x00,$key
+	?vperm		$rndkey0,$rndkey0,v30,$keyperm
+	addi		$key_,$sp,$FRAME+15
+	mtctr		$rounds
+
+Load_ctr32_enc_key:
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v30,$x10,$key
+	addi		$key,$key,0x20
+	stvx		v24,$x00,$key_		# off-load round[1]
+	?vperm		v25,v31,v30,$keyperm
+	lvx		v31,$x00,$key
+	stvx		v25,$x10,$key_		# off-load round[2]
+	addi		$key_,$key_,0x20
+	bdnz		Load_ctr32_enc_key
+
+	lvx		v26,$x10,$key
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v27,$x20,$key
+	stvx		v24,$x00,$key_		# off-load round[3]
+	?vperm		v25,v31,v26,$keyperm
+	lvx		v28,$x30,$key
+	stvx		v25,$x10,$key_		# off-load round[4]
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	?vperm		v26,v26,v27,$keyperm
+	lvx		v29,$x40,$key
+	?vperm		v27,v27,v28,$keyperm
+	lvx		v30,$x50,$key
+	?vperm		v28,v28,v29,$keyperm
+	lvx		v31,$x60,$key
+	?vperm		v29,v29,v30,$keyperm
+	lvx		$out0,$x70,$key		# borrow $out0
+	?vperm		v30,v30,v31,$keyperm
+	lvx		v24,$x00,$key_		# pre-load round[1]
+	?vperm		v31,v31,$out0,$keyperm
+	lvx		v25,$x10,$key_		# pre-load round[2]
+
+	vadduqm		$two,$one,$one
+	subi		$inp,$inp,15		# undo "caller"
+	$SHL		$len,$len,4
+
+	vadduqm		$out1,$ivec,$one	# counter values ...
+	vadduqm		$out2,$ivec,$two	# (do all ctr adds as 128-bit)
+	vxor		$out0,$ivec,$rndkey0	# ... xored with rndkey[0]
+	 le?li		$idx,8
+	vadduqm		$out3,$out1,$two
+	vxor		$out1,$out1,$rndkey0
+	 le?lvsl	$inpperm,0,$idx
+	vadduqm		$out4,$out2,$two
+	vxor		$out2,$out2,$rndkey0
+	 le?vspltisb	$tmp,0x0f
+	vadduqm		$out5,$out3,$two
+	vxor		$out3,$out3,$rndkey0
+	 le?vxor	$inpperm,$inpperm,$tmp	# transform for lvx_u/stvx_u
+	vadduqm		$out6,$out4,$two
+	vxor		$out4,$out4,$rndkey0
+	vadduqm		$out7,$out5,$two
+	vxor		$out5,$out5,$rndkey0
+	vadduqm		$ivec,$out6,$two	# next counter value
+	vxor		$out6,$out6,$rndkey0
+	vxor		$out7,$out7,$rndkey0
+
+	mtctr		$rounds
+	b		Loop_ctr32_enc8x
+.align	5
+Loop_ctr32_enc8x:
+	vcipher 	$out0,$out0,v24
+	vcipher 	$out1,$out1,v24
+	vcipher 	$out2,$out2,v24
+	vcipher 	$out3,$out3,v24
+	vcipher 	$out4,$out4,v24
+	vcipher 	$out5,$out5,v24
+	vcipher 	$out6,$out6,v24
+	vcipher 	$out7,$out7,v24
+Loop_ctr32_enc8x_middle:
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vcipher 	$out0,$out0,v25
+	vcipher 	$out1,$out1,v25
+	vcipher 	$out2,$out2,v25
+	vcipher 	$out3,$out3,v25
+	vcipher 	$out4,$out4,v25
+	vcipher 	$out5,$out5,v25
+	vcipher 	$out6,$out6,v25
+	vcipher 	$out7,$out7,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_ctr32_enc8x
+
+	subic		r11,$len,256		# $len-256, borrow $key_
+	vcipher 	$out0,$out0,v24
+	vcipher 	$out1,$out1,v24
+	vcipher 	$out2,$out2,v24
+	vcipher 	$out3,$out3,v24
+	vcipher 	$out4,$out4,v24
+	vcipher 	$out5,$out5,v24
+	vcipher 	$out6,$out6,v24
+	vcipher 	$out7,$out7,v24
+
+	subfe		r0,r0,r0		# borrow?-1:0
+	vcipher 	$out0,$out0,v25
+	vcipher 	$out1,$out1,v25
+	vcipher 	$out2,$out2,v25
+	vcipher 	$out3,$out3,v25
+	vcipher 	$out4,$out4,v25
+	vcipher		$out5,$out5,v25
+	vcipher		$out6,$out6,v25
+	vcipher		$out7,$out7,v25
+
+	and		r0,r0,r11
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vcipher		$out0,$out0,v26
+	vcipher		$out1,$out1,v26
+	vcipher		$out2,$out2,v26
+	vcipher		$out3,$out3,v26
+	vcipher		$out4,$out4,v26
+	vcipher		$out5,$out5,v26
+	vcipher		$out6,$out6,v26
+	vcipher		$out7,$out7,v26
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+
+	subic		$len,$len,129		# $len-=129
+	vcipher		$out0,$out0,v27
+	addi		$len,$len,1		# $len-=128 really
+	vcipher		$out1,$out1,v27
+	vcipher		$out2,$out2,v27
+	vcipher		$out3,$out3,v27
+	vcipher		$out4,$out4,v27
+	vcipher		$out5,$out5,v27
+	vcipher		$out6,$out6,v27
+	vcipher		$out7,$out7,v27
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+
+	vcipher		$out0,$out0,v28
+	 lvx_u		$in0,$x00,$inp		# load input
+	vcipher		$out1,$out1,v28
+	 lvx_u		$in1,$x10,$inp
+	vcipher		$out2,$out2,v28
+	 lvx_u		$in2,$x20,$inp
+	vcipher		$out3,$out3,v28
+	 lvx_u		$in3,$x30,$inp
+	vcipher		$out4,$out4,v28
+	 lvx_u		$in4,$x40,$inp
+	vcipher		$out5,$out5,v28
+	 lvx_u		$in5,$x50,$inp
+	vcipher		$out6,$out6,v28
+	 lvx_u		$in6,$x60,$inp
+	vcipher		$out7,$out7,v28
+	 lvx_u		$in7,$x70,$inp
+	 addi		$inp,$inp,0x80
+
+	vcipher		$out0,$out0,v29
+	 le?vperm	$in0,$in0,$in0,$inpperm
+	vcipher		$out1,$out1,v29
+	 le?vperm	$in1,$in1,$in1,$inpperm
+	vcipher		$out2,$out2,v29
+	 le?vperm	$in2,$in2,$in2,$inpperm
+	vcipher		$out3,$out3,v29
+	 le?vperm	$in3,$in3,$in3,$inpperm
+	vcipher		$out4,$out4,v29
+	 le?vperm	$in4,$in4,$in4,$inpperm
+	vcipher		$out5,$out5,v29
+	 le?vperm	$in5,$in5,$in5,$inpperm
+	vcipher		$out6,$out6,v29
+	 le?vperm	$in6,$in6,$in6,$inpperm
+	vcipher		$out7,$out7,v29
+	 le?vperm	$in7,$in7,$in7,$inpperm
+
+	add		$inp,$inp,r0		# $inp is adjusted in such
+						# way that at exit from the
+						# loop inX-in7 are loaded
+						# with last "words"
+	subfe.		r0,r0,r0		# borrow?-1:0
+	vcipher		$out0,$out0,v30
+	 vxor		$in0,$in0,v31		# xor with last round key
+	vcipher		$out1,$out1,v30
+	 vxor		$in1,$in1,v31
+	vcipher		$out2,$out2,v30
+	 vxor		$in2,$in2,v31
+	vcipher		$out3,$out3,v30
+	 vxor		$in3,$in3,v31
+	vcipher		$out4,$out4,v30
+	 vxor		$in4,$in4,v31
+	vcipher		$out5,$out5,v30
+	 vxor		$in5,$in5,v31
+	vcipher		$out6,$out6,v30
+	 vxor		$in6,$in6,v31
+	vcipher		$out7,$out7,v30
+	 vxor		$in7,$in7,v31
+
+	bne		Lctr32_enc8x_break	# did $len-129 borrow?
+
+	vcipherlast	$in0,$out0,$in0
+	vcipherlast	$in1,$out1,$in1
+	 vadduqm	$out1,$ivec,$one	# counter values ...
+	vcipherlast	$in2,$out2,$in2
+	 vadduqm	$out2,$ivec,$two
+	 vxor		$out0,$ivec,$rndkey0	# ... xored with rndkey[0]
+	vcipherlast	$in3,$out3,$in3
+	 vadduqm	$out3,$out1,$two
+	 vxor		$out1,$out1,$rndkey0
+	vcipherlast	$in4,$out4,$in4
+	 vadduqm	$out4,$out2,$two
+	 vxor		$out2,$out2,$rndkey0
+	vcipherlast	$in5,$out5,$in5
+	 vadduqm	$out5,$out3,$two
+	 vxor		$out3,$out3,$rndkey0
+	vcipherlast	$in6,$out6,$in6
+	 vadduqm	$out6,$out4,$two
+	 vxor		$out4,$out4,$rndkey0
+	vcipherlast	$in7,$out7,$in7
+	 vadduqm	$out7,$out5,$two
+	 vxor		$out5,$out5,$rndkey0
+	le?vperm	$in0,$in0,$in0,$inpperm
+	 vadduqm	$ivec,$out6,$two	# next counter value
+	 vxor		$out6,$out6,$rndkey0
+	le?vperm	$in1,$in1,$in1,$inpperm
+	 vxor		$out7,$out7,$rndkey0
+	mtctr		$rounds
+
+	 vcipher	$out0,$out0,v24
+	stvx_u		$in0,$x00,$out
+	le?vperm	$in2,$in2,$in2,$inpperm
+	 vcipher	$out1,$out1,v24
+	stvx_u		$in1,$x10,$out
+	le?vperm	$in3,$in3,$in3,$inpperm
+	 vcipher	$out2,$out2,v24
+	stvx_u		$in2,$x20,$out
+	le?vperm	$in4,$in4,$in4,$inpperm
+	 vcipher	$out3,$out3,v24
+	stvx_u		$in3,$x30,$out
+	le?vperm	$in5,$in5,$in5,$inpperm
+	 vcipher	$out4,$out4,v24
+	stvx_u		$in4,$x40,$out
+	le?vperm	$in6,$in6,$in6,$inpperm
+	 vcipher	$out5,$out5,v24
+	stvx_u		$in5,$x50,$out
+	le?vperm	$in7,$in7,$in7,$inpperm
+	 vcipher	$out6,$out6,v24
+	stvx_u		$in6,$x60,$out
+	 vcipher	$out7,$out7,v24
+	stvx_u		$in7,$x70,$out
+	addi		$out,$out,0x80
+
+	b		Loop_ctr32_enc8x_middle
+
+.align	5
+Lctr32_enc8x_break:
+	cmpwi		$len,-0x60
+	blt		Lctr32_enc8x_one
+	nop
+	beq		Lctr32_enc8x_two
+	cmpwi		$len,-0x40
+	blt		Lctr32_enc8x_three
+	nop
+	beq		Lctr32_enc8x_four
+	cmpwi		$len,-0x20
+	blt		Lctr32_enc8x_five
+	nop
+	beq		Lctr32_enc8x_six
+	cmpwi		$len,0x00
+	blt		Lctr32_enc8x_seven
+
+Lctr32_enc8x_eight:
+	vcipherlast	$out0,$out0,$in0
+	vcipherlast	$out1,$out1,$in1
+	vcipherlast	$out2,$out2,$in2
+	vcipherlast	$out3,$out3,$in3
+	vcipherlast	$out4,$out4,$in4
+	vcipherlast	$out5,$out5,$in5
+	vcipherlast	$out6,$out6,$in6
+	vcipherlast	$out7,$out7,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x30,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x40,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x50,$out
+	le?vperm	$out7,$out7,$out7,$inpperm
+	stvx_u		$out6,$x60,$out
+	stvx_u		$out7,$x70,$out
+	addi		$out,$out,0x80
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_seven:
+	vcipherlast	$out0,$out0,$in1
+	vcipherlast	$out1,$out1,$in2
+	vcipherlast	$out2,$out2,$in3
+	vcipherlast	$out3,$out3,$in4
+	vcipherlast	$out4,$out4,$in5
+	vcipherlast	$out5,$out5,$in6
+	vcipherlast	$out6,$out6,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x30,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x40,$out
+	le?vperm	$out6,$out6,$out6,$inpperm
+	stvx_u		$out5,$x50,$out
+	stvx_u		$out6,$x60,$out
+	addi		$out,$out,0x70
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_six:
+	vcipherlast	$out0,$out0,$in2
+	vcipherlast	$out1,$out1,$in3
+	vcipherlast	$out2,$out2,$in4
+	vcipherlast	$out3,$out3,$in5
+	vcipherlast	$out4,$out4,$in6
+	vcipherlast	$out5,$out5,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x30,$out
+	le?vperm	$out5,$out5,$out5,$inpperm
+	stvx_u		$out4,$x40,$out
+	stvx_u		$out5,$x50,$out
+	addi		$out,$out,0x60
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_five:
+	vcipherlast	$out0,$out0,$in3
+	vcipherlast	$out1,$out1,$in4
+	vcipherlast	$out2,$out2,$in5
+	vcipherlast	$out3,$out3,$in6
+	vcipherlast	$out4,$out4,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	le?vperm	$out4,$out4,$out4,$inpperm
+	stvx_u		$out3,$x30,$out
+	stvx_u		$out4,$x40,$out
+	addi		$out,$out,0x50
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_four:
+	vcipherlast	$out0,$out0,$in4
+	vcipherlast	$out1,$out1,$in5
+	vcipherlast	$out2,$out2,$in6
+	vcipherlast	$out3,$out3,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$inpperm
+	stvx_u		$out2,$x20,$out
+	stvx_u		$out3,$x30,$out
+	addi		$out,$out,0x40
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_three:
+	vcipherlast	$out0,$out0,$in5
+	vcipherlast	$out1,$out1,$in6
+	vcipherlast	$out2,$out2,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	le?vperm	$out2,$out2,$out2,$inpperm
+	stvx_u		$out1,$x10,$out
+	stvx_u		$out2,$x20,$out
+	addi		$out,$out,0x30
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_two:
+	vcipherlast	$out0,$out0,$in6
+	vcipherlast	$out1,$out1,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	le?vperm	$out1,$out1,$out1,$inpperm
+	stvx_u		$out0,$x00,$out
+	stvx_u		$out1,$x10,$out
+	addi		$out,$out,0x20
+	b		Lctr32_enc8x_done
+
+.align	5
+Lctr32_enc8x_one:
+	vcipherlast	$out0,$out0,$in7
+
+	le?vperm	$out0,$out0,$out0,$inpperm
+	stvx_u		$out0,0,$out
+	addi		$out,$out,0x10
+
+Lctr32_enc8x_done:
+	li		r10,`$FRAME+15`
+	li		r11,`$FRAME+31`
+	stvx		$inpperm,r10,$sp	# wipe copies of round keys
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+	stvx		$inpperm,r10,$sp
+	addi		r10,r10,32
+	stvx		$inpperm,r11,$sp
+	addi		r11,r11,32
+
+	mtspr		256,$vrsave
+	lvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	lvx		v21,r11,$sp
+	addi		r11,r11,32
+	lvx		v22,r10,$sp
+	addi		r10,r10,32
+	lvx		v23,r11,$sp
+	addi		r11,r11,32
+	lvx		v24,r10,$sp
+	addi		r10,r10,32
+	lvx		v25,r11,$sp
+	addi		r11,r11,32
+	lvx		v26,r10,$sp
+	addi		r10,r10,32
+	lvx		v27,r11,$sp
+	addi		r11,r11,32
+	lvx		v28,r10,$sp
+	addi		r10,r10,32
+	lvx		v29,r11,$sp
+	addi		r11,r11,32
+	lvx		v30,r10,$sp
+	lvx		v31,r11,$sp
+	$POP		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	$POP		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	$POP		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	$POP		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	$POP		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	$POP		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	addi		$sp,$sp,`$FRAME+21*16+6*$SIZE_T`
+	blr
+	.long		0
+	.byte		0,12,0x14,0,0x80,6,6,0
+	.long		0
+.size	.${prefix}_ctr32_encrypt_blocks,.-.${prefix}_ctr32_encrypt_blocks
+___
+}}	}}}
+
+#########################################################################
+{{{	# XTS procedures						#
+# int aes_p8_xts_[en|de]crypt(const char *inp, char *out, size_t len,	#
+#                             const AES_KEY *key1, const AES_KEY *key2,	#
+#                             [const] unsigned char iv[16]);		#
+# If $key2 is NULL, then a "tweak chaining" mode is engaged, in which	#
+# input tweak value is assumed to be encrypted already, and last tweak	#
+# value, one suitable for consecutive call on same chunk of data, is	#
+# written back to original buffer. In addition, in "tweak chaining"	#
+# mode only complete input blocks are processed.			#
+
+my ($inp,$out,$len,$key1,$key2,$ivp,$rounds,$idx) =	map("r$_",(3..10));
+my ($rndkey0,$rndkey1,$inout) =				map("v$_",(0..2));
+my ($output,$inptail,$inpperm,$leperm,$keyperm) =	map("v$_",(3..7));
+my ($tweak,$seven,$eighty7,$tmp,$tweak1) =		map("v$_",(8..12));
+my $taillen = $key2;
+
+   ($inp,$idx) = ($idx,$inp);				# reassign
+
+$code.=<<___;
+.globl	.${prefix}_xts_encrypt
+	mr		$inp,r3				# reassign
+	li		r3,-1
+	${UCMP}i	$len,16
+	bltlr-
+
+	lis		r0,0xfff0
+	mfspr		r12,256				# save vrsave
+	li		r11,0
+	mtspr		256,r0
+
+	vspltisb	$seven,0x07			# 0x070707..07
+	le?lvsl		$leperm,r11,r11
+	le?vspltisb	$tmp,0x0f
+	le?vxor		$leperm,$leperm,$seven
+
+	li		$idx,15
+	lvx		$tweak,0,$ivp			# load [unaligned] iv
+	lvsl		$inpperm,0,$ivp
+	lvx		$inptail,$idx,$ivp
+	le?vxor		$inpperm,$inpperm,$tmp
+	vperm		$tweak,$tweak,$inptail,$inpperm
+
+	neg		r11,$inp
+	lvsr		$inpperm,0,r11			# prepare for unaligned load
+	lvx		$inout,0,$inp
+	addi		$inp,$inp,15			# 15 is not typo
+	le?vxor		$inpperm,$inpperm,$tmp
+
+	${UCMP}i	$key2,0				# key2==NULL?
+	beq		Lxts_enc_no_key2
+
+	?lvsl		$keyperm,0,$key2		# prepare for unaligned key
+	lwz		$rounds,240($key2)
+	srwi		$rounds,$rounds,1
+	subi		$rounds,$rounds,1
+	li		$idx,16
+
+	lvx		$rndkey0,0,$key2
+	lvx		$rndkey1,$idx,$key2
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$tweak,$tweak,$rndkey0
+	lvx		$rndkey0,$idx,$key2
+	addi		$idx,$idx,16
+	mtctr		$rounds
+
+Ltweak_xts_enc:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$tweak,$tweak,$rndkey1
+	lvx		$rndkey1,$idx,$key2
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipher		$tweak,$tweak,$rndkey0
+	lvx		$rndkey0,$idx,$key2
+	addi		$idx,$idx,16
+	bdnz		Ltweak_xts_enc
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$tweak,$tweak,$rndkey1
+	lvx		$rndkey1,$idx,$key2
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipherlast	$tweak,$tweak,$rndkey0
+
+	li		$ivp,0				# don't chain the tweak
+	b		Lxts_enc
+
+Lxts_enc_no_key2:
+	li		$idx,-16
+	and		$len,$len,$idx			# in "tweak chaining"
+							# mode only complete
+							# blocks are processed
+Lxts_enc:
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+
+	?lvsl		$keyperm,0,$key1		# prepare for unaligned key
+	lwz		$rounds,240($key1)
+	srwi		$rounds,$rounds,1
+	subi		$rounds,$rounds,1
+	li		$idx,16
+
+	vslb		$eighty7,$seven,$seven		# 0x808080..80
+	vor		$eighty7,$eighty7,$seven	# 0x878787..87
+	vspltisb	$tmp,1				# 0x010101..01
+	vsldoi		$eighty7,$eighty7,$tmp,15	# 0x870101..01
+
+	${UCMP}i	$len,96
+	bge		_aesp8_xts_encrypt6x
+
+	andi.		$taillen,$len,15
+	subic		r0,$len,32
+	subi		$taillen,$taillen,16
+	subfe		r0,r0,r0
+	and		r0,r0,$taillen
+	add		$inp,$inp,r0
+
+	lvx		$rndkey0,0,$key1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	vperm		$inout,$inout,$inptail,$inpperm
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$inout,$tweak
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+	mtctr		$rounds
+	b		Loop_xts_enc
+
+.align	5
+Loop_xts_enc:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipher		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+	bdnz		Loop_xts_enc
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	li		$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$rndkey0,$rndkey0,$tweak
+	vcipherlast	$output,$inout,$rndkey0
+
+	le?vperm	$tmp,$output,$output,$leperm
+	be?nop
+	le?stvx_u	$tmp,0,$out
+	be?stvx_u	$output,0,$out
+	addi		$out,$out,16
+
+	subic.		$len,$len,16
+	beq		Lxts_enc_done
+
+	vmr		$inout,$inptail
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+	lvx		$rndkey0,0,$key1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+
+	subic		r0,$len,32
+	subfe		r0,r0,r0
+	and		r0,r0,$taillen
+	add		$inp,$inp,r0
+
+	vsrab		$tmp,$tweak,$seven		# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vsldoi		$tmp,$tmp,$tmp,15
+	vand		$tmp,$tmp,$eighty7
+	vxor		$tweak,$tweak,$tmp
+
+	vperm		$inout,$inout,$inptail,$inpperm
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$inout,$tweak
+	vxor		$output,$output,$rndkey0	# just in case $len<16
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+
+	mtctr		$rounds
+	${UCMP}i	$len,16
+	bge		Loop_xts_enc
+
+	vxor		$output,$output,$tweak
+	lvsr		$inpperm,0,$len			# $inpperm is no longer needed
+	vxor		$inptail,$inptail,$inptail	# $inptail is no longer needed
+	vspltisb	$tmp,-1
+	vperm		$inptail,$inptail,$tmp,$inpperm
+	vsel		$inout,$inout,$output,$inptail
+
+	subi		r11,$out,17
+	subi		$out,$out,16
+	mtctr		$len
+	li		$len,16
+Loop_xts_enc_steal:
+	lbzu		r0,1(r11)
+	stb		r0,16(r11)
+	bdnz		Loop_xts_enc_steal
+
+	mtctr		$rounds
+	b		Loop_xts_enc			# one more time...
+
+Lxts_enc_done:
+	${UCMP}i	$ivp,0
+	beq		Lxts_enc_ret
+
+	vsrab		$tmp,$tweak,$seven		# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vsldoi		$tmp,$tmp,$tmp,15
+	vand		$tmp,$tmp,$eighty7
+	vxor		$tweak,$tweak,$tmp
+
+	le?vperm	$tweak,$tweak,$tweak,$leperm
+	stvx_u		$tweak,0,$ivp
+
+Lxts_enc_ret:
+	mtspr		256,r12				# restore vrsave
+	li		r3,0
+	blr
+	.long		0
+	.byte		0,12,0x04,0,0x80,6,6,0
+	.long		0
+.size	.${prefix}_xts_encrypt,.-.${prefix}_xts_encrypt
+
+.globl	.${prefix}_xts_decrypt
+	mr		$inp,r3				# reassign
+	li		r3,-1
+	${UCMP}i	$len,16
+	bltlr-
+
+	lis		r0,0xfff8
+	mfspr		r12,256				# save vrsave
+	li		r11,0
+	mtspr		256,r0
+
+	andi.		r0,$len,15
+	neg		r0,r0
+	andi.		r0,r0,16
+	sub		$len,$len,r0
+
+	vspltisb	$seven,0x07			# 0x070707..07
+	le?lvsl		$leperm,r11,r11
+	le?vspltisb	$tmp,0x0f
+	le?vxor		$leperm,$leperm,$seven
+
+	li		$idx,15
+	lvx		$tweak,0,$ivp			# load [unaligned] iv
+	lvsl		$inpperm,0,$ivp
+	lvx		$inptail,$idx,$ivp
+	le?vxor		$inpperm,$inpperm,$tmp
+	vperm		$tweak,$tweak,$inptail,$inpperm
+
+	neg		r11,$inp
+	lvsr		$inpperm,0,r11			# prepare for unaligned load
+	lvx		$inout,0,$inp
+	addi		$inp,$inp,15			# 15 is not typo
+	le?vxor		$inpperm,$inpperm,$tmp
+
+	${UCMP}i	$key2,0				# key2==NULL?
+	beq		Lxts_dec_no_key2
+
+	?lvsl		$keyperm,0,$key2		# prepare for unaligned key
+	lwz		$rounds,240($key2)
+	srwi		$rounds,$rounds,1
+	subi		$rounds,$rounds,1
+	li		$idx,16
+
+	lvx		$rndkey0,0,$key2
+	lvx		$rndkey1,$idx,$key2
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$tweak,$tweak,$rndkey0
+	lvx		$rndkey0,$idx,$key2
+	addi		$idx,$idx,16
+	mtctr		$rounds
+
+Ltweak_xts_dec:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$tweak,$tweak,$rndkey1
+	lvx		$rndkey1,$idx,$key2
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipher		$tweak,$tweak,$rndkey0
+	lvx		$rndkey0,$idx,$key2
+	addi		$idx,$idx,16
+	bdnz		Ltweak_xts_dec
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vcipher		$tweak,$tweak,$rndkey1
+	lvx		$rndkey1,$idx,$key2
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vcipherlast	$tweak,$tweak,$rndkey0
+
+	li		$ivp,0				# don't chain the tweak
+	b		Lxts_dec
+
+Lxts_dec_no_key2:
+	neg		$idx,$len
+	andi.		$idx,$idx,15
+	add		$len,$len,$idx			# in "tweak chaining"
+							# mode only complete
+							# blocks are processed
+Lxts_dec:
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+
+	?lvsl		$keyperm,0,$key1		# prepare for unaligned key
+	lwz		$rounds,240($key1)
+	srwi		$rounds,$rounds,1
+	subi		$rounds,$rounds,1
+	li		$idx,16
+
+	vslb		$eighty7,$seven,$seven		# 0x808080..80
+	vor		$eighty7,$eighty7,$seven	# 0x878787..87
+	vspltisb	$tmp,1				# 0x010101..01
+	vsldoi		$eighty7,$eighty7,$tmp,15	# 0x870101..01
+
+	${UCMP}i	$len,96
+	bge		_aesp8_xts_decrypt6x
+
+	lvx		$rndkey0,0,$key1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	vperm		$inout,$inout,$inptail,$inpperm
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$inout,$tweak
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+	mtctr		$rounds
+
+	${UCMP}i	$len,16
+	blt		Ltail_xts_dec
+	be?b		Loop_xts_dec
+
+.align	5
+Loop_xts_dec:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vncipher	$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+	bdnz		Loop_xts_dec
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	li		$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$rndkey0,$rndkey0,$tweak
+	vncipherlast	$output,$inout,$rndkey0
+
+	le?vperm	$tmp,$output,$output,$leperm
+	be?nop
+	le?stvx_u	$tmp,0,$out
+	be?stvx_u	$output,0,$out
+	addi		$out,$out,16
+
+	subic.		$len,$len,16
+	beq		Lxts_dec_done
+
+	vmr		$inout,$inptail
+	lvx		$inptail,0,$inp
+	addi		$inp,$inp,16
+	lvx		$rndkey0,0,$key1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+
+	vsrab		$tmp,$tweak,$seven		# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vsldoi		$tmp,$tmp,$tmp,15
+	vand		$tmp,$tmp,$eighty7
+	vxor		$tweak,$tweak,$tmp
+
+	vperm		$inout,$inout,$inptail,$inpperm
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$inout,$inout,$tweak
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+
+	mtctr		$rounds
+	${UCMP}i	$len,16
+	bge		Loop_xts_dec
+
+Ltail_xts_dec:
+	vsrab		$tmp,$tweak,$seven		# next tweak value
+	vaddubm		$tweak1,$tweak,$tweak
+	vsldoi		$tmp,$tmp,$tmp,15
+	vand		$tmp,$tmp,$eighty7
+	vxor		$tweak1,$tweak1,$tmp
+
+	subi		$inp,$inp,16
+	add		$inp,$inp,$len
+
+	vxor		$inout,$inout,$tweak		# :-(
+	vxor		$inout,$inout,$tweak1		# :-)
+
+Loop_xts_dec_short:
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vncipher	$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+	bdnz		Loop_xts_dec_short
+
+	?vperm		$rndkey1,$rndkey1,$rndkey0,$keyperm
+	vncipher	$inout,$inout,$rndkey1
+	lvx		$rndkey1,$idx,$key1
+	li		$idx,16
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+	vxor		$rndkey0,$rndkey0,$tweak1
+	vncipherlast	$output,$inout,$rndkey0
+
+	le?vperm	$tmp,$output,$output,$leperm
+	be?nop
+	le?stvx_u	$tmp,0,$out
+	be?stvx_u	$output,0,$out
+
+	vmr		$inout,$inptail
+	lvx		$inptail,0,$inp
+	#addi		$inp,$inp,16
+	lvx		$rndkey0,0,$key1
+	lvx		$rndkey1,$idx,$key1
+	addi		$idx,$idx,16
+	vperm		$inout,$inout,$inptail,$inpperm
+	?vperm		$rndkey0,$rndkey0,$rndkey1,$keyperm
+
+	lvsr		$inpperm,0,$len			# $inpperm is no longer needed
+	vxor		$inptail,$inptail,$inptail	# $inptail is no longer needed
+	vspltisb	$tmp,-1
+	vperm		$inptail,$inptail,$tmp,$inpperm
+	vsel		$inout,$inout,$output,$inptail
+
+	vxor		$rndkey0,$rndkey0,$tweak
+	vxor		$inout,$inout,$rndkey0
+	lvx		$rndkey0,$idx,$key1
+	addi		$idx,$idx,16
+
+	subi		r11,$out,1
+	mtctr		$len
+	li		$len,16
+Loop_xts_dec_steal:
+	lbzu		r0,1(r11)
+	stb		r0,16(r11)
+	bdnz		Loop_xts_dec_steal
+
+	mtctr		$rounds
+	b		Loop_xts_dec			# one more time...
+
+Lxts_dec_done:
+	${UCMP}i	$ivp,0
+	beq		Lxts_dec_ret
+
+	vsrab		$tmp,$tweak,$seven		# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vsldoi		$tmp,$tmp,$tmp,15
+	vand		$tmp,$tmp,$eighty7
+	vxor		$tweak,$tweak,$tmp
+
+	le?vperm	$tweak,$tweak,$tweak,$leperm
+	stvx_u		$tweak,0,$ivp
+
+Lxts_dec_ret:
+	mtspr		256,r12				# restore vrsave
+	li		r3,0
+	blr
+	.long		0
+	.byte		0,12,0x04,0,0x80,6,6,0
+	.long		0
+.size	.${prefix}_xts_decrypt,.-.${prefix}_xts_decrypt
+___
+#########################################################################
+{{	# Optimized XTS procedures					#
+my $key_=$key2;
+my ($x00,$x10,$x20,$x30,$x40,$x50,$x60,$x70)=map("r$_",(0,3,26..31));
+    $x00=0 if ($flavour =~ /osx/);
+my ($in0,  $in1,  $in2,  $in3,  $in4,  $in5 )=map("v$_",(0..5));
+my ($out0, $out1, $out2, $out3, $out4, $out5)=map("v$_",(7,12..16));
+my ($twk0, $twk1, $twk2, $twk3, $twk4, $twk5)=map("v$_",(17..22));
+my $rndkey0="v23";	# v24-v25 rotating buffer for first found keys
+			# v26-v31 last 6 round keys
+my ($keyperm)=($out0);	# aliases with "caller", redundant assignment
+my $taillen=$x70;
+
+$code.=<<___;
+.align	5
+_aesp8_xts_encrypt6x:
+	$STU		$sp,-`($FRAME+21*16+6*$SIZE_T)`($sp)
+	mflr		r11
+	li		r7,`$FRAME+8*16+15`
+	li		r3,`$FRAME+8*16+31`
+	$PUSH		r11,`$FRAME+21*16+6*$SIZE_T+$LRSAVE`($sp)
+	stvx		v20,r7,$sp		# ABI says so
+	addi		r7,r7,32
+	stvx		v21,r3,$sp
+	addi		r3,r3,32
+	stvx		v22,r7,$sp
+	addi		r7,r7,32
+	stvx		v23,r3,$sp
+	addi		r3,r3,32
+	stvx		v24,r7,$sp
+	addi		r7,r7,32
+	stvx		v25,r3,$sp
+	addi		r3,r3,32
+	stvx		v26,r7,$sp
+	addi		r7,r7,32
+	stvx		v27,r3,$sp
+	addi		r3,r3,32
+	stvx		v28,r7,$sp
+	addi		r7,r7,32
+	stvx		v29,r3,$sp
+	addi		r3,r3,32
+	stvx		v30,r7,$sp
+	stvx		v31,r3,$sp
+	li		r0,-1
+	stw		$vrsave,`$FRAME+21*16-4`($sp)	# save vrsave
+	li		$x10,0x10
+	$PUSH		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	li		$x20,0x20
+	$PUSH		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	li		$x30,0x30
+	$PUSH		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	li		$x40,0x40
+	$PUSH		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	li		$x50,0x50
+	$PUSH		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	li		$x60,0x60
+	$PUSH		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	li		$x70,0x70
+	mtspr		256,r0
+
+	xxlor		2, 32+$eighty7, 32+$eighty7
+	vsldoi		$eighty7,$tmp,$eighty7,1        # 0x010101..87
+	xxlor		1, 32+$eighty7, 32+$eighty7
+
+	# Load XOR Lconsts.
+	mr		$x70, r6
+	bl		Lconsts
+	lxvw4x		0, $x40, r6		# load XOR contents
+	mr		r6, $x70
+	li		$x70,0x70
+
+	subi		$rounds,$rounds,3	# -4 in total
+
+	lvx		$rndkey0,$x00,$key1	# load key schedule
+	lvx		v30,$x10,$key1
+	addi		$key1,$key1,0x20
+	lvx		v31,$x00,$key1
+	?vperm		$rndkey0,$rndkey0,v30,$keyperm
+	addi		$key_,$sp,$FRAME+15
+	mtctr		$rounds
+
+Load_xts_enc_key:
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v30,$x10,$key1
+	addi		$key1,$key1,0x20
+	stvx		v24,$x00,$key_		# off-load round[1]
+	?vperm		v25,v31,v30,$keyperm
+	lvx		v31,$x00,$key1
+	stvx		v25,$x10,$key_		# off-load round[2]
+	addi		$key_,$key_,0x20
+	bdnz		Load_xts_enc_key
+
+	lvx		v26,$x10,$key1
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v27,$x20,$key1
+	stvx		v24,$x00,$key_		# off-load round[3]
+	?vperm		v25,v31,v26,$keyperm
+	lvx		v28,$x30,$key1
+	stvx		v25,$x10,$key_		# off-load round[4]
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	?vperm		v26,v26,v27,$keyperm
+	lvx		v29,$x40,$key1
+	?vperm		v27,v27,v28,$keyperm
+	lvx		v30,$x50,$key1
+	?vperm		v28,v28,v29,$keyperm
+	lvx		v31,$x60,$key1
+	?vperm		v29,v29,v30,$keyperm
+	lvx		$twk5,$x70,$key1	# borrow $twk5
+	?vperm		v30,v30,v31,$keyperm
+	lvx		v24,$x00,$key_		# pre-load round[1]
+	?vperm		v31,v31,$twk5,$keyperm
+	lvx		v25,$x10,$key_		# pre-load round[2]
+
+	# Switch to use the following codes with 0x010101..87 to generate tweak.
+	#     eighty7 = 0x010101..87
+	# vsrab         tmp, tweak, seven       # next tweak value, right shift 7 bits
+	# vand          tmp, tmp, eighty7       # last byte with carry
+	# vaddubm       tweak, tweak, tweak     # left shift 1 bit (x2)
+	# xxlor         vsx, 0, 0
+	# vpermxor      tweak, tweak, tmp, vsx
+
+	 vperm		$in0,$inout,$inptail,$inpperm
+	 subi		$inp,$inp,31		# undo "caller"
+	vxor		$twk0,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out0,$in0,$twk0
+	xxlor		32+$in1, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in1
+
+	 lvx_u		$in1,$x10,$inp
+	vxor		$twk1,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in1,$in1,$in1,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out1,$in1,$twk1
+	xxlor		32+$in2, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in2
+
+	 lvx_u		$in2,$x20,$inp
+	 andi.		$taillen,$len,15
+	vxor		$twk2,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in2,$in2,$in2,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out2,$in2,$twk2
+	xxlor		32+$in3, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in3
+
+	 lvx_u		$in3,$x30,$inp
+	 sub		$len,$len,$taillen
+	vxor		$twk3,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in3,$in3,$in3,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out3,$in3,$twk3
+	xxlor		32+$in4, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in4
+
+	 lvx_u		$in4,$x40,$inp
+	 subi		$len,$len,0x60
+	vxor		$twk4,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in4,$in4,$in4,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out4,$in4,$twk4
+	xxlor		32+$in5, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in5
+
+	 lvx_u		$in5,$x50,$inp
+	 addi		$inp,$inp,0x60
+	vxor		$twk5,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in5,$in5,$in5,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out5,$in5,$twk5
+	xxlor		32+$in0, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in0
+
+	vxor		v31,v31,$rndkey0
+	mtctr		$rounds
+	b		Loop_xts_enc6x
+
+.align	5
+Loop_xts_enc6x:
+	vcipher		$out0,$out0,v24
+	vcipher		$out1,$out1,v24
+	vcipher		$out2,$out2,v24
+	vcipher		$out3,$out3,v24
+	vcipher		$out4,$out4,v24
+	vcipher		$out5,$out5,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vcipher		$out0,$out0,v25
+	vcipher		$out1,$out1,v25
+	vcipher		$out2,$out2,v25
+	vcipher		$out3,$out3,v25
+	vcipher		$out4,$out4,v25
+	vcipher		$out5,$out5,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_xts_enc6x
+
+	xxlor		32+$eighty7, 1, 1	# 0x010101..87
+
+	subic		$len,$len,96		# $len-=96
+	 vxor		$in0,$twk0,v31		# xor with last round key
+	vcipher		$out0,$out0,v24
+	vcipher		$out1,$out1,v24
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk0,$tweak,$rndkey0
+	 vaddubm	$tweak,$tweak,$tweak
+	vcipher		$out2,$out2,v24
+	vcipher		$out3,$out3,v24
+	vcipher		$out4,$out4,v24
+	vcipher		$out5,$out5,v24
+
+	subfe.		r0,r0,r0		# borrow?-1:0
+	 vand		$tmp,$tmp,$eighty7
+	vcipher		$out0,$out0,v25
+	vcipher		$out1,$out1,v25
+	 xxlor		32+$in1, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in1
+	vcipher		$out2,$out2,v25
+	vcipher		$out3,$out3,v25
+	 vxor		$in1,$twk1,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk1,$tweak,$rndkey0
+	vcipher		$out4,$out4,v25
+	vcipher		$out5,$out5,v25
+
+	and		r0,r0,$len
+	 vaddubm	$tweak,$tweak,$tweak
+	vcipher		$out0,$out0,v26
+	vcipher		$out1,$out1,v26
+	 vand		$tmp,$tmp,$eighty7
+	vcipher		$out2,$out2,v26
+	vcipher		$out3,$out3,v26
+	 xxlor		32+$in2, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in2
+	vcipher		$out4,$out4,v26
+	vcipher		$out5,$out5,v26
+
+	add		$inp,$inp,r0		# $inp is adjusted in such
+						# way that at exit from the
+						# loop inX-in5 are loaded
+						# with last "words"
+	 vxor		$in2,$twk2,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk2,$tweak,$rndkey0
+	 vaddubm	$tweak,$tweak,$tweak
+	vcipher		$out0,$out0,v27
+	vcipher		$out1,$out1,v27
+	vcipher		$out2,$out2,v27
+	vcipher		$out3,$out3,v27
+	 vand		$tmp,$tmp,$eighty7
+	vcipher		$out4,$out4,v27
+	vcipher		$out5,$out5,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	 xxlor		32+$in3, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in3
+	vcipher		$out0,$out0,v28
+	vcipher		$out1,$out1,v28
+	 vxor		$in3,$twk3,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk3,$tweak,$rndkey0
+	vcipher		$out2,$out2,v28
+	vcipher		$out3,$out3,v28
+	 vaddubm	$tweak,$tweak,$tweak
+	vcipher		$out4,$out4,v28
+	vcipher		$out5,$out5,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+	 vand		$tmp,$tmp,$eighty7
+
+	vcipher		$out0,$out0,v29
+	vcipher		$out1,$out1,v29
+	 xxlor		32+$in4, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in4
+	vcipher		$out2,$out2,v29
+	vcipher		$out3,$out3,v29
+	 vxor		$in4,$twk4,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk4,$tweak,$rndkey0
+	vcipher		$out4,$out4,v29
+	vcipher		$out5,$out5,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vaddubm	$tweak,$tweak,$tweak
+
+	vcipher		$out0,$out0,v30
+	vcipher		$out1,$out1,v30
+	 vand		$tmp,$tmp,$eighty7
+	vcipher		$out2,$out2,v30
+	vcipher		$out3,$out3,v30
+	 xxlor		32+$in5, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in5
+	vcipher		$out4,$out4,v30
+	vcipher		$out5,$out5,v30
+	 vxor		$in5,$twk5,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk5,$tweak,$rndkey0
+
+	vcipherlast	$out0,$out0,$in0
+	 lvx_u		$in0,$x00,$inp		# load next input block
+	 vaddubm	$tweak,$tweak,$tweak
+	vcipherlast	$out1,$out1,$in1
+	 lvx_u		$in1,$x10,$inp
+	vcipherlast	$out2,$out2,$in2
+	 le?vperm	$in0,$in0,$in0,$leperm
+	 lvx_u		$in2,$x20,$inp
+	 vand		$tmp,$tmp,$eighty7
+	vcipherlast	$out3,$out3,$in3
+	 le?vperm	$in1,$in1,$in1,$leperm
+	 lvx_u		$in3,$x30,$inp
+	vcipherlast	$out4,$out4,$in4
+	 le?vperm	$in2,$in2,$in2,$leperm
+	 lvx_u		$in4,$x40,$inp
+	 xxlor		10, 32+$in0, 32+$in0
+	 xxlor		32+$in0, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in0
+	 xxlor		32+$in0, 10, 10
+	vcipherlast	$tmp,$out5,$in5		# last block might be needed
+						# in stealing mode
+	 le?vperm	$in3,$in3,$in3,$leperm
+	 lvx_u		$in5,$x50,$inp
+	 addi		$inp,$inp,0x60
+	 le?vperm	$in4,$in4,$in4,$leperm
+	 le?vperm	$in5,$in5,$in5,$leperm
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	 vxor		$out0,$in0,$twk0
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	 vxor		$out1,$in1,$twk1
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	 vxor		$out2,$in2,$twk2
+	le?vperm	$out4,$out4,$out4,$leperm
+	stvx_u		$out3,$x30,$out
+	 vxor		$out3,$in3,$twk3
+	le?vperm	$out5,$tmp,$tmp,$leperm
+	stvx_u		$out4,$x40,$out
+	 vxor		$out4,$in4,$twk4
+	le?stvx_u	$out5,$x50,$out
+	be?stvx_u	$tmp, $x50,$out
+	 vxor		$out5,$in5,$twk5
+	addi		$out,$out,0x60
+
+	mtctr		$rounds
+	beq		Loop_xts_enc6x		# did $len-=96 borrow?
+
+	xxlor		32+$eighty7, 2, 2	# 0x010101..87
+
+	addic.		$len,$len,0x60
+	beq		Lxts_enc6x_zero
+	cmpwi		$len,0x20
+	blt		Lxts_enc6x_one
+	nop
+	beq		Lxts_enc6x_two
+	cmpwi		$len,0x40
+	blt		Lxts_enc6x_three
+	nop
+	beq		Lxts_enc6x_four
+
+Lxts_enc6x_five:
+	vxor		$out0,$in1,$twk0
+	vxor		$out1,$in2,$twk1
+	vxor		$out2,$in3,$twk2
+	vxor		$out3,$in4,$twk3
+	vxor		$out4,$in5,$twk4
+
+	bl		_aesp8_xts_enc5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk5		# unused tweak
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	vxor		$tmp,$out4,$twk5	# last block prep for stealing
+	le?vperm	$out4,$out4,$out4,$leperm
+	stvx_u		$out3,$x30,$out
+	stvx_u		$out4,$x40,$out
+	addi		$out,$out,0x50
+	bne		Lxts_enc6x_steal
+	b		Lxts_enc6x_done
+
+.align	4
+Lxts_enc6x_four:
+	vxor		$out0,$in2,$twk0
+	vxor		$out1,$in3,$twk1
+	vxor		$out2,$in4,$twk2
+	vxor		$out3,$in5,$twk3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_enc5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk4		# unused tweak
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	vxor		$tmp,$out3,$twk4	# last block prep for stealing
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	stvx_u		$out3,$x30,$out
+	addi		$out,$out,0x40
+	bne		Lxts_enc6x_steal
+	b		Lxts_enc6x_done
+
+.align	4
+Lxts_enc6x_three:
+	vxor		$out0,$in3,$twk0
+	vxor		$out1,$in4,$twk1
+	vxor		$out2,$in5,$twk2
+	vxor		$out3,$out3,$out3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_enc5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk3		# unused tweak
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	vxor		$tmp,$out2,$twk3	# last block prep for stealing
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	stvx_u		$out2,$x20,$out
+	addi		$out,$out,0x30
+	bne		Lxts_enc6x_steal
+	b		Lxts_enc6x_done
+
+.align	4
+Lxts_enc6x_two:
+	vxor		$out0,$in4,$twk0
+	vxor		$out1,$in5,$twk1
+	vxor		$out2,$out2,$out2
+	vxor		$out3,$out3,$out3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_enc5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk2		# unused tweak
+	vxor		$tmp,$out1,$twk2	# last block prep for stealing
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	stvx_u		$out1,$x10,$out
+	addi		$out,$out,0x20
+	bne		Lxts_enc6x_steal
+	b		Lxts_enc6x_done
+
+.align	4
+Lxts_enc6x_one:
+	vxor		$out0,$in5,$twk0
+	nop
+Loop_xts_enc1x:
+	vcipher		$out0,$out0,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vcipher		$out0,$out0,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_xts_enc1x
+
+	add		$inp,$inp,$taillen
+	cmpwi		$taillen,0
+	vcipher		$out0,$out0,v24
+
+	subi		$inp,$inp,16
+	vcipher		$out0,$out0,v25
+
+	lvsr		$inpperm,0,$taillen
+	vcipher		$out0,$out0,v26
+
+	lvx_u		$in0,0,$inp
+	vcipher		$out0,$out0,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vcipher		$out0,$out0,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+
+	vcipher		$out0,$out0,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vxor		$twk0,$twk0,v31
+
+	le?vperm	$in0,$in0,$in0,$leperm
+	vcipher		$out0,$out0,v30
+
+	vperm		$in0,$in0,$in0,$inpperm
+	vcipherlast	$out0,$out0,$twk0
+
+	vmr		$twk0,$twk1		# unused tweak
+	vxor		$tmp,$out0,$twk1	# last block prep for stealing
+	le?vperm	$out0,$out0,$out0,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	addi		$out,$out,0x10
+	bne		Lxts_enc6x_steal
+	b		Lxts_enc6x_done
+
+.align	4
+Lxts_enc6x_zero:
+	cmpwi		$taillen,0
+	beq		Lxts_enc6x_done
+
+	add		$inp,$inp,$taillen
+	subi		$inp,$inp,16
+	lvx_u		$in0,0,$inp
+	lvsr		$inpperm,0,$taillen	# $in5 is no more
+	le?vperm	$in0,$in0,$in0,$leperm
+	vperm		$in0,$in0,$in0,$inpperm
+	vxor		$tmp,$tmp,$twk0
+Lxts_enc6x_steal:
+	vxor		$in0,$in0,$twk0
+	vxor		$out0,$out0,$out0
+	vspltisb	$out1,-1
+	vperm		$out0,$out0,$out1,$inpperm
+	vsel		$out0,$in0,$tmp,$out0	# $tmp is last block, remember?
+
+	subi		r30,$out,17
+	subi		$out,$out,16
+	mtctr		$taillen
+Loop_xts_enc6x_steal:
+	lbzu		r0,1(r30)
+	stb		r0,16(r30)
+	bdnz		Loop_xts_enc6x_steal
+
+	li		$taillen,0
+	mtctr		$rounds
+	b		Loop_xts_enc1x		# one more time...
+
+.align	4
+Lxts_enc6x_done:
+	${UCMP}i	$ivp,0
+	beq		Lxts_enc6x_ret
+
+	vxor		$tweak,$twk0,$rndkey0
+	le?vperm	$tweak,$tweak,$tweak,$leperm
+	stvx_u		$tweak,0,$ivp
+
+Lxts_enc6x_ret:
+	mtlr		r11
+	li		r10,`$FRAME+15`
+	li		r11,`$FRAME+31`
+	stvx		$seven,r10,$sp		# wipe copies of round keys
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+
+	mtspr		256,$vrsave
+	lvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	lvx		v21,r11,$sp
+	addi		r11,r11,32
+	lvx		v22,r10,$sp
+	addi		r10,r10,32
+	lvx		v23,r11,$sp
+	addi		r11,r11,32
+	lvx		v24,r10,$sp
+	addi		r10,r10,32
+	lvx		v25,r11,$sp
+	addi		r11,r11,32
+	lvx		v26,r10,$sp
+	addi		r10,r10,32
+	lvx		v27,r11,$sp
+	addi		r11,r11,32
+	lvx		v28,r10,$sp
+	addi		r10,r10,32
+	lvx		v29,r11,$sp
+	addi		r11,r11,32
+	lvx		v30,r10,$sp
+	lvx		v31,r11,$sp
+	$POP		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	$POP		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	$POP		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	$POP		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	$POP		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	$POP		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	addi		$sp,$sp,`$FRAME+21*16+6*$SIZE_T`
+	blr
+	.long		0
+	.byte		0,12,0x04,1,0x80,6,6,0
+	.long		0
+
+.align	5
+_aesp8_xts_enc5x:
+	vcipher		$out0,$out0,v24
+	vcipher		$out1,$out1,v24
+	vcipher		$out2,$out2,v24
+	vcipher		$out3,$out3,v24
+	vcipher		$out4,$out4,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vcipher		$out0,$out0,v25
+	vcipher		$out1,$out1,v25
+	vcipher		$out2,$out2,v25
+	vcipher		$out3,$out3,v25
+	vcipher		$out4,$out4,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		_aesp8_xts_enc5x
+
+	add		$inp,$inp,$taillen
+	cmpwi		$taillen,0
+	vcipher		$out0,$out0,v24
+	vcipher		$out1,$out1,v24
+	vcipher		$out2,$out2,v24
+	vcipher		$out3,$out3,v24
+	vcipher		$out4,$out4,v24
+
+	subi		$inp,$inp,16
+	vcipher		$out0,$out0,v25
+	vcipher		$out1,$out1,v25
+	vcipher		$out2,$out2,v25
+	vcipher		$out3,$out3,v25
+	vcipher		$out4,$out4,v25
+	 vxor		$twk0,$twk0,v31
+
+	vcipher		$out0,$out0,v26
+	lvsr		$inpperm,r0,$taillen	# $in5 is no more
+	vcipher		$out1,$out1,v26
+	vcipher		$out2,$out2,v26
+	vcipher		$out3,$out3,v26
+	vcipher		$out4,$out4,v26
+	 vxor		$in1,$twk1,v31
+
+	vcipher		$out0,$out0,v27
+	lvx_u		$in0,0,$inp
+	vcipher		$out1,$out1,v27
+	vcipher		$out2,$out2,v27
+	vcipher		$out3,$out3,v27
+	vcipher		$out4,$out4,v27
+	 vxor		$in2,$twk2,v31
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vcipher		$out0,$out0,v28
+	vcipher		$out1,$out1,v28
+	vcipher		$out2,$out2,v28
+	vcipher		$out3,$out3,v28
+	vcipher		$out4,$out4,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+	 vxor		$in3,$twk3,v31
+
+	vcipher		$out0,$out0,v29
+	le?vperm	$in0,$in0,$in0,$leperm
+	vcipher		$out1,$out1,v29
+	vcipher		$out2,$out2,v29
+	vcipher		$out3,$out3,v29
+	vcipher		$out4,$out4,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vxor		$in4,$twk4,v31
+
+	vcipher		$out0,$out0,v30
+	vperm		$in0,$in0,$in0,$inpperm
+	vcipher		$out1,$out1,v30
+	vcipher		$out2,$out2,v30
+	vcipher		$out3,$out3,v30
+	vcipher		$out4,$out4,v30
+
+	vcipherlast	$out0,$out0,$twk0
+	vcipherlast	$out1,$out1,$in1
+	vcipherlast	$out2,$out2,$in2
+	vcipherlast	$out3,$out3,$in3
+	vcipherlast	$out4,$out4,$in4
+	blr
+        .long   	0
+        .byte   	0,12,0x14,0,0,0,0,0
+
+.align	5
+_aesp8_xts_decrypt6x:
+	$STU		$sp,-`($FRAME+21*16+6*$SIZE_T)`($sp)
+	mflr		r11
+	li		r7,`$FRAME+8*16+15`
+	li		r3,`$FRAME+8*16+31`
+	$PUSH		r11,`$FRAME+21*16+6*$SIZE_T+$LRSAVE`($sp)
+	stvx		v20,r7,$sp		# ABI says so
+	addi		r7,r7,32
+	stvx		v21,r3,$sp
+	addi		r3,r3,32
+	stvx		v22,r7,$sp
+	addi		r7,r7,32
+	stvx		v23,r3,$sp
+	addi		r3,r3,32
+	stvx		v24,r7,$sp
+	addi		r7,r7,32
+	stvx		v25,r3,$sp
+	addi		r3,r3,32
+	stvx		v26,r7,$sp
+	addi		r7,r7,32
+	stvx		v27,r3,$sp
+	addi		r3,r3,32
+	stvx		v28,r7,$sp
+	addi		r7,r7,32
+	stvx		v29,r3,$sp
+	addi		r3,r3,32
+	stvx		v30,r7,$sp
+	stvx		v31,r3,$sp
+	li		r0,-1
+	stw		$vrsave,`$FRAME+21*16-4`($sp)	# save vrsave
+	li		$x10,0x10
+	$PUSH		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	li		$x20,0x20
+	$PUSH		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	li		$x30,0x30
+	$PUSH		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	li		$x40,0x40
+	$PUSH		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	li		$x50,0x50
+	$PUSH		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	li		$x60,0x60
+	$PUSH		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	li		$x70,0x70
+	mtspr		256,r0
+
+	xxlor		2, 32+$eighty7, 32+$eighty7
+	vsldoi		$eighty7,$tmp,$eighty7,1        # 0x010101..87
+	xxlor		1, 32+$eighty7, 32+$eighty7
+
+	# Load XOR Lconsts.
+	mr		$x70, r6
+	bl		Lconsts
+	lxvw4x		0, $x40, r6		# load XOR contents
+	mr		r6, $x70
+	li		$x70,0x70
+
+	subi		$rounds,$rounds,3	# -4 in total
+
+	lvx		$rndkey0,$x00,$key1	# load key schedule
+	lvx		v30,$x10,$key1
+	addi		$key1,$key1,0x20
+	lvx		v31,$x00,$key1
+	?vperm		$rndkey0,$rndkey0,v30,$keyperm
+	addi		$key_,$sp,$FRAME+15
+	mtctr		$rounds
+
+Load_xts_dec_key:
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v30,$x10,$key1
+	addi		$key1,$key1,0x20
+	stvx		v24,$x00,$key_		# off-load round[1]
+	?vperm		v25,v31,v30,$keyperm
+	lvx		v31,$x00,$key1
+	stvx		v25,$x10,$key_		# off-load round[2]
+	addi		$key_,$key_,0x20
+	bdnz		Load_xts_dec_key
+
+	lvx		v26,$x10,$key1
+	?vperm		v24,v30,v31,$keyperm
+	lvx		v27,$x20,$key1
+	stvx		v24,$x00,$key_		# off-load round[3]
+	?vperm		v25,v31,v26,$keyperm
+	lvx		v28,$x30,$key1
+	stvx		v25,$x10,$key_		# off-load round[4]
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	?vperm		v26,v26,v27,$keyperm
+	lvx		v29,$x40,$key1
+	?vperm		v27,v27,v28,$keyperm
+	lvx		v30,$x50,$key1
+	?vperm		v28,v28,v29,$keyperm
+	lvx		v31,$x60,$key1
+	?vperm		v29,v29,v30,$keyperm
+	lvx		$twk5,$x70,$key1	# borrow $twk5
+	?vperm		v30,v30,v31,$keyperm
+	lvx		v24,$x00,$key_		# pre-load round[1]
+	?vperm		v31,v31,$twk5,$keyperm
+	lvx		v25,$x10,$key_		# pre-load round[2]
+
+	 vperm		$in0,$inout,$inptail,$inpperm
+	 subi		$inp,$inp,31		# undo "caller"
+	vxor		$twk0,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out0,$in0,$twk0
+	xxlor		32+$in1, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in1
+
+	 lvx_u		$in1,$x10,$inp
+	vxor		$twk1,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in1,$in1,$in1,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out1,$in1,$twk1
+	xxlor		32+$in2, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in2
+
+	 lvx_u		$in2,$x20,$inp
+	 andi.		$taillen,$len,15
+	vxor		$twk2,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in2,$in2,$in2,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out2,$in2,$twk2
+	xxlor		32+$in3, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in3
+
+	 lvx_u		$in3,$x30,$inp
+	 sub		$len,$len,$taillen
+	vxor		$twk3,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in3,$in3,$in3,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out3,$in3,$twk3
+	xxlor		32+$in4, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in4
+
+	 lvx_u		$in4,$x40,$inp
+	 subi		$len,$len,0x60
+	vxor		$twk4,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in4,$in4,$in4,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out4,$in4,$twk4
+	xxlor		32+$in5, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in5
+
+	 lvx_u		$in5,$x50,$inp
+	 addi		$inp,$inp,0x60
+	vxor		$twk5,$tweak,$rndkey0
+	vsrab		$tmp,$tweak,$seven	# next tweak value
+	vaddubm		$tweak,$tweak,$tweak
+	 le?vperm	$in5,$in5,$in5,$leperm
+	vand		$tmp,$tmp,$eighty7
+	 vxor		$out5,$in5,$twk5
+	xxlor		32+$in0, 0, 0
+	vpermxor	$tweak, $tweak, $tmp, $in0
+
+	vxor		v31,v31,$rndkey0
+	mtctr		$rounds
+	b		Loop_xts_dec6x
+
+.align	5
+Loop_xts_dec6x:
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_xts_dec6x
+
+	xxlor		32+$eighty7, 1, 1	# 0x010101..87
+
+	subic		$len,$len,96		# $len-=96
+	 vxor		$in0,$twk0,v31		# xor with last round key
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk0,$tweak,$rndkey0
+	 vaddubm	$tweak,$tweak,$tweak
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	vncipher	$out5,$out5,v24
+
+	subfe.		r0,r0,r0		# borrow?-1:0
+	 vand		$tmp,$tmp,$eighty7
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	 xxlor		32+$in1, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in1
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	 vxor		$in1,$twk1,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk1,$tweak,$rndkey0
+	vncipher	$out4,$out4,v25
+	vncipher	$out5,$out5,v25
+
+	and		r0,r0,$len
+	 vaddubm	$tweak,$tweak,$tweak
+	vncipher	$out0,$out0,v26
+	vncipher	$out1,$out1,v26
+	 vand		$tmp,$tmp,$eighty7
+	vncipher	$out2,$out2,v26
+	vncipher	$out3,$out3,v26
+	 xxlor		32+$in2, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in2
+	vncipher	$out4,$out4,v26
+	vncipher	$out5,$out5,v26
+
+	add		$inp,$inp,r0		# $inp is adjusted in such
+						# way that at exit from the
+						# loop inX-in5 are loaded
+						# with last "words"
+	 vxor		$in2,$twk2,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk2,$tweak,$rndkey0
+	 vaddubm	$tweak,$tweak,$tweak
+	vncipher	$out0,$out0,v27
+	vncipher	$out1,$out1,v27
+	vncipher	$out2,$out2,v27
+	vncipher	$out3,$out3,v27
+	 vand		$tmp,$tmp,$eighty7
+	vncipher	$out4,$out4,v27
+	vncipher	$out5,$out5,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	 xxlor		32+$in3, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in3
+	vncipher	$out0,$out0,v28
+	vncipher	$out1,$out1,v28
+	 vxor		$in3,$twk3,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk3,$tweak,$rndkey0
+	vncipher	$out2,$out2,v28
+	vncipher	$out3,$out3,v28
+	 vaddubm	$tweak,$tweak,$tweak
+	vncipher	$out4,$out4,v28
+	vncipher	$out5,$out5,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+	 vand		$tmp,$tmp,$eighty7
+
+	vncipher	$out0,$out0,v29
+	vncipher	$out1,$out1,v29
+	 xxlor		32+$in4, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in4
+	vncipher	$out2,$out2,v29
+	vncipher	$out3,$out3,v29
+	 vxor		$in4,$twk4,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk4,$tweak,$rndkey0
+	vncipher	$out4,$out4,v29
+	vncipher	$out5,$out5,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vaddubm	$tweak,$tweak,$tweak
+
+	vncipher	$out0,$out0,v30
+	vncipher	$out1,$out1,v30
+	 vand		$tmp,$tmp,$eighty7
+	vncipher	$out2,$out2,v30
+	vncipher	$out3,$out3,v30
+	 xxlor		32+$in5, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in5
+	vncipher	$out4,$out4,v30
+	vncipher	$out5,$out5,v30
+	 vxor		$in5,$twk5,v31
+	 vsrab		$tmp,$tweak,$seven	# next tweak value
+	 vxor		$twk5,$tweak,$rndkey0
+
+	vncipherlast	$out0,$out0,$in0
+	 lvx_u		$in0,$x00,$inp		# load next input block
+	 vaddubm	$tweak,$tweak,$tweak
+	vncipherlast	$out1,$out1,$in1
+	 lvx_u		$in1,$x10,$inp
+	vncipherlast	$out2,$out2,$in2
+	 le?vperm	$in0,$in0,$in0,$leperm
+	 lvx_u		$in2,$x20,$inp
+	 vand		$tmp,$tmp,$eighty7
+	vncipherlast	$out3,$out3,$in3
+	 le?vperm	$in1,$in1,$in1,$leperm
+	 lvx_u		$in3,$x30,$inp
+	vncipherlast	$out4,$out4,$in4
+	 le?vperm	$in2,$in2,$in2,$leperm
+	 lvx_u		$in4,$x40,$inp
+	 xxlor		10, 32+$in0, 32+$in0
+	 xxlor		32+$in0, 0, 0
+	 vpermxor	$tweak, $tweak, $tmp, $in0
+	 xxlor		32+$in0, 10, 10
+	vncipherlast	$out5,$out5,$in5
+	 le?vperm	$in3,$in3,$in3,$leperm
+	 lvx_u		$in5,$x50,$inp
+	 addi		$inp,$inp,0x60
+	 le?vperm	$in4,$in4,$in4,$leperm
+	 le?vperm	$in5,$in5,$in5,$leperm
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	 vxor		$out0,$in0,$twk0
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	 vxor		$out1,$in1,$twk1
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	 vxor		$out2,$in2,$twk2
+	le?vperm	$out4,$out4,$out4,$leperm
+	stvx_u		$out3,$x30,$out
+	 vxor		$out3,$in3,$twk3
+	le?vperm	$out5,$out5,$out5,$leperm
+	stvx_u		$out4,$x40,$out
+	 vxor		$out4,$in4,$twk4
+	stvx_u		$out5,$x50,$out
+	 vxor		$out5,$in5,$twk5
+	addi		$out,$out,0x60
+
+	mtctr		$rounds
+	beq		Loop_xts_dec6x		# did $len-=96 borrow?
+
+	xxlor		32+$eighty7, 2, 2	# 0x010101..87
+
+	addic.		$len,$len,0x60
+	beq		Lxts_dec6x_zero
+	cmpwi		$len,0x20
+	blt		Lxts_dec6x_one
+	nop
+	beq		Lxts_dec6x_two
+	cmpwi		$len,0x40
+	blt		Lxts_dec6x_three
+	nop
+	beq		Lxts_dec6x_four
+
+Lxts_dec6x_five:
+	vxor		$out0,$in1,$twk0
+	vxor		$out1,$in2,$twk1
+	vxor		$out2,$in3,$twk2
+	vxor		$out3,$in4,$twk3
+	vxor		$out4,$in5,$twk4
+
+	bl		_aesp8_xts_dec5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk5		# unused tweak
+	vxor		$twk1,$tweak,$rndkey0
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	vxor		$out0,$in0,$twk1
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	le?vperm	$out4,$out4,$out4,$leperm
+	stvx_u		$out3,$x30,$out
+	stvx_u		$out4,$x40,$out
+	addi		$out,$out,0x50
+	bne		Lxts_dec6x_steal
+	b		Lxts_dec6x_done
+
+.align	4
+Lxts_dec6x_four:
+	vxor		$out0,$in2,$twk0
+	vxor		$out1,$in3,$twk1
+	vxor		$out2,$in4,$twk2
+	vxor		$out3,$in5,$twk3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_dec5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk4		# unused tweak
+	vmr		$twk1,$twk5
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	vxor		$out0,$in0,$twk5
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	le?vperm	$out3,$out3,$out3,$leperm
+	stvx_u		$out2,$x20,$out
+	stvx_u		$out3,$x30,$out
+	addi		$out,$out,0x40
+	bne		Lxts_dec6x_steal
+	b		Lxts_dec6x_done
+
+.align	4
+Lxts_dec6x_three:
+	vxor		$out0,$in3,$twk0
+	vxor		$out1,$in4,$twk1
+	vxor		$out2,$in5,$twk2
+	vxor		$out3,$out3,$out3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_dec5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk3		# unused tweak
+	vmr		$twk1,$twk4
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	vxor		$out0,$in0,$twk4
+	le?vperm	$out2,$out2,$out2,$leperm
+	stvx_u		$out1,$x10,$out
+	stvx_u		$out2,$x20,$out
+	addi		$out,$out,0x30
+	bne		Lxts_dec6x_steal
+	b		Lxts_dec6x_done
+
+.align	4
+Lxts_dec6x_two:
+	vxor		$out0,$in4,$twk0
+	vxor		$out1,$in5,$twk1
+	vxor		$out2,$out2,$out2
+	vxor		$out3,$out3,$out3
+	vxor		$out4,$out4,$out4
+
+	bl		_aesp8_xts_dec5x
+
+	le?vperm	$out0,$out0,$out0,$leperm
+	vmr		$twk0,$twk2		# unused tweak
+	vmr		$twk1,$twk3
+	le?vperm	$out1,$out1,$out1,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	vxor		$out0,$in0,$twk3
+	stvx_u		$out1,$x10,$out
+	addi		$out,$out,0x20
+	bne		Lxts_dec6x_steal
+	b		Lxts_dec6x_done
+
+.align	4
+Lxts_dec6x_one:
+	vxor		$out0,$in5,$twk0
+	nop
+Loop_xts_dec1x:
+	vncipher	$out0,$out0,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out0,$out0,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Loop_xts_dec1x
+
+	subi		r0,$taillen,1
+	vncipher	$out0,$out0,v24
+
+	andi.		r0,r0,16
+	cmpwi		$taillen,0
+	vncipher	$out0,$out0,v25
+
+	sub		$inp,$inp,r0
+	vncipher	$out0,$out0,v26
+
+	lvx_u		$in0,0,$inp
+	vncipher	$out0,$out0,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vncipher	$out0,$out0,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+
+	vncipher	$out0,$out0,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vxor		$twk0,$twk0,v31
+
+	le?vperm	$in0,$in0,$in0,$leperm
+	vncipher	$out0,$out0,v30
+
+	mtctr		$rounds
+	vncipherlast	$out0,$out0,$twk0
+
+	vmr		$twk0,$twk1		# unused tweak
+	vmr		$twk1,$twk2
+	le?vperm	$out0,$out0,$out0,$leperm
+	stvx_u		$out0,$x00,$out		# store output
+	addi		$out,$out,0x10
+	vxor		$out0,$in0,$twk2
+	bne		Lxts_dec6x_steal
+	b		Lxts_dec6x_done
+
+.align	4
+Lxts_dec6x_zero:
+	cmpwi		$taillen,0
+	beq		Lxts_dec6x_done
+
+	lvx_u		$in0,0,$inp
+	le?vperm	$in0,$in0,$in0,$leperm
+	vxor		$out0,$in0,$twk1
+Lxts_dec6x_steal:
+	vncipher	$out0,$out0,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out0,$out0,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		Lxts_dec6x_steal
+
+	add		$inp,$inp,$taillen
+	vncipher	$out0,$out0,v24
+
+	cmpwi		$taillen,0
+	vncipher	$out0,$out0,v25
+
+	lvx_u		$in0,0,$inp
+	vncipher	$out0,$out0,v26
+
+	lvsr		$inpperm,0,$taillen	# $in5 is no more
+	vncipher	$out0,$out0,v27
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vncipher	$out0,$out0,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+
+	vncipher	$out0,$out0,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vxor		$twk1,$twk1,v31
+
+	le?vperm	$in0,$in0,$in0,$leperm
+	vncipher	$out0,$out0,v30
+
+	vperm		$in0,$in0,$in0,$inpperm
+	vncipherlast	$tmp,$out0,$twk1
+
+	le?vperm	$out0,$tmp,$tmp,$leperm
+	le?stvx_u	$out0,0,$out
+	be?stvx_u	$tmp,0,$out
+
+	vxor		$out0,$out0,$out0
+	vspltisb	$out1,-1
+	vperm		$out0,$out0,$out1,$inpperm
+	vsel		$out0,$in0,$tmp,$out0
+	vxor		$out0,$out0,$twk0
+
+	subi		r30,$out,1
+	mtctr		$taillen
+Loop_xts_dec6x_steal:
+	lbzu		r0,1(r30)
+	stb		r0,16(r30)
+	bdnz		Loop_xts_dec6x_steal
+
+	li		$taillen,0
+	mtctr		$rounds
+	b		Loop_xts_dec1x		# one more time...
+
+.align	4
+Lxts_dec6x_done:
+	${UCMP}i	$ivp,0
+	beq		Lxts_dec6x_ret
+
+	vxor		$tweak,$twk0,$rndkey0
+	le?vperm	$tweak,$tweak,$tweak,$leperm
+	stvx_u		$tweak,0,$ivp
+
+Lxts_dec6x_ret:
+	mtlr		r11
+	li		r10,`$FRAME+15`
+	li		r11,`$FRAME+31`
+	stvx		$seven,r10,$sp		# wipe copies of round keys
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+	stvx		$seven,r10,$sp
+	addi		r10,r10,32
+	stvx		$seven,r11,$sp
+	addi		r11,r11,32
+
+	mtspr		256,$vrsave
+	lvx		v20,r10,$sp		# ABI says so
+	addi		r10,r10,32
+	lvx		v21,r11,$sp
+	addi		r11,r11,32
+	lvx		v22,r10,$sp
+	addi		r10,r10,32
+	lvx		v23,r11,$sp
+	addi		r11,r11,32
+	lvx		v24,r10,$sp
+	addi		r10,r10,32
+	lvx		v25,r11,$sp
+	addi		r11,r11,32
+	lvx		v26,r10,$sp
+	addi		r10,r10,32
+	lvx		v27,r11,$sp
+	addi		r11,r11,32
+	lvx		v28,r10,$sp
+	addi		r10,r10,32
+	lvx		v29,r11,$sp
+	addi		r11,r11,32
+	lvx		v30,r10,$sp
+	lvx		v31,r11,$sp
+	$POP		r26,`$FRAME+21*16+0*$SIZE_T`($sp)
+	$POP		r27,`$FRAME+21*16+1*$SIZE_T`($sp)
+	$POP		r28,`$FRAME+21*16+2*$SIZE_T`($sp)
+	$POP		r29,`$FRAME+21*16+3*$SIZE_T`($sp)
+	$POP		r30,`$FRAME+21*16+4*$SIZE_T`($sp)
+	$POP		r31,`$FRAME+21*16+5*$SIZE_T`($sp)
+	addi		$sp,$sp,`$FRAME+21*16+6*$SIZE_T`
+	blr
+	.long		0
+	.byte		0,12,0x04,1,0x80,6,6,0
+	.long		0
+
+.align	5
+_aesp8_xts_dec5x:
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+	lvx		v24,$x20,$key_		# round[3]
+	addi		$key_,$key_,0x20
+
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	lvx		v25,$x10,$key_		# round[4]
+	bdnz		_aesp8_xts_dec5x
+
+	subi		r0,$taillen,1
+	vncipher	$out0,$out0,v24
+	vncipher	$out1,$out1,v24
+	vncipher	$out2,$out2,v24
+	vncipher	$out3,$out3,v24
+	vncipher	$out4,$out4,v24
+
+	andi.		r0,r0,16
+	cmpwi		$taillen,0
+	vncipher	$out0,$out0,v25
+	vncipher	$out1,$out1,v25
+	vncipher	$out2,$out2,v25
+	vncipher	$out3,$out3,v25
+	vncipher	$out4,$out4,v25
+	 vxor		$twk0,$twk0,v31
+
+	sub		$inp,$inp,r0
+	vncipher	$out0,$out0,v26
+	vncipher	$out1,$out1,v26
+	vncipher	$out2,$out2,v26
+	vncipher	$out3,$out3,v26
+	vncipher	$out4,$out4,v26
+	 vxor		$in1,$twk1,v31
+
+	vncipher	$out0,$out0,v27
+	lvx_u		$in0,0,$inp
+	vncipher	$out1,$out1,v27
+	vncipher	$out2,$out2,v27
+	vncipher	$out3,$out3,v27
+	vncipher	$out4,$out4,v27
+	 vxor		$in2,$twk2,v31
+
+	addi		$key_,$sp,$FRAME+15	# rewind $key_
+	vncipher	$out0,$out0,v28
+	vncipher	$out1,$out1,v28
+	vncipher	$out2,$out2,v28
+	vncipher	$out3,$out3,v28
+	vncipher	$out4,$out4,v28
+	lvx		v24,$x00,$key_		# re-pre-load round[1]
+	 vxor		$in3,$twk3,v31
+
+	vncipher	$out0,$out0,v29
+	le?vperm	$in0,$in0,$in0,$leperm
+	vncipher	$out1,$out1,v29
+	vncipher	$out2,$out2,v29
+	vncipher	$out3,$out3,v29
+	vncipher	$out4,$out4,v29
+	lvx		v25,$x10,$key_		# re-pre-load round[2]
+	 vxor		$in4,$twk4,v31
+
+	vncipher	$out0,$out0,v30
+	vncipher	$out1,$out1,v30
+	vncipher	$out2,$out2,v30
+	vncipher	$out3,$out3,v30
+	vncipher	$out4,$out4,v30
+
+	vncipherlast	$out0,$out0,$twk0
+	vncipherlast	$out1,$out1,$in1
+	vncipherlast	$out2,$out2,$in2
+	vncipherlast	$out3,$out3,$in3
+	vncipherlast	$out4,$out4,$in4
+	mtctr		$rounds
+	blr
+        .long   	0
+        .byte   	0,12,0x14,0,0,0,0,0
+___
+}}	}}}
 
 my $consts=1;
 foreach(split("\n",$code)) {
